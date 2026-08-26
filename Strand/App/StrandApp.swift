@@ -24,6 +24,8 @@ struct StrandApp: App {
         UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
     }
 
+    /// Fork-only: `noop://buzz` URL door + dynamic Dock icon (see MacAppDelegate.swift).
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
     /// Shared cross-screen navigation hook (e.g. Live → Devices). The macOS shell (`RootView`)
     /// observes it and drives the sidebar selection.
