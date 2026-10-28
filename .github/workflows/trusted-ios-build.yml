@@ -7,10 +7,13 @@
 #
 # The build/package steps reproduce upstream fork-release.yml's `ios` job at v12.0.0 (Release,
 # signing off, Watch app stripped, widget kept, Tools/prepare-ios-sideload-app.sh, zip Payload/),
-# minus the release upload. Trigger is manual only.
+# minus the release upload. Triggers: a push to phone-hub (GitHub only offers the manual button for
+# workflows on the default branch, and this file lives only on phone-hub) or a manual dispatch.
 name: Trusted iOS build
 
 on:
+  push:
+    branches: [phone-hub]
   workflow_dispatch:
 
 permissions:
@@ -36,6 +39,9 @@ jobs:
 
       - name: Generate Xcode project
         run: xcodegen generate
+
+      - name: Record resolved Swift package versions
+        run: find . -name Package.resolved -not -path './build/*' -print -exec cat {} \;
 
       # Release, not Debug: a Debug build carries get-task-allow and fails re-signed sideload (#53).
       - name: Build NOOPiOS for device (unsigned, Release)
