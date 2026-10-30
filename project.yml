@@ -516,6 +516,23 @@ targets:
     dependencies:
       - package: StrandDesign
 
+  # ---------------------------------------------------------------------------
+  # FORK-ONLY (phone-hub): host-less iOS unit tests for the Health Hub patch. Compiles the
+  # Foundation-only StrandiOS/Hub/Core sources straight into the bundle (no app host, no packages),
+  # the same way StrandTests compiles StrandiOSShared files. Run by trusted-ios-build.yml on a
+  # simulator before the device build. Not part of upstream NOOP.
+  NOOPiOSHubTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - StrandiOSTests/Hub
+      - StrandiOS/Hub/Core
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).noop.hubtests
+
 # Explicit schemes so `xcodebuild -scheme Strand …` builds + tests the macOS app (with StrandTests
 # wired in) and `-scheme NOOPiOS …` builds the iOS app. Names match the app-build CI matrix.
 schemes:
@@ -543,3 +560,12 @@ schemes:
         NOOPWatch: all
     run:
       config: Debug
+  # FORK-ONLY (phone-hub): `xcodebuild test -scheme NOOPiOSHubTests` on a simulator.
+  NOOPiOSHubTests:
+    build:
+      targets:
+        NOOPiOSHubTests: [test]
+    test:
+      config: Debug
+      targets:
+        - NOOPiOSHubTests

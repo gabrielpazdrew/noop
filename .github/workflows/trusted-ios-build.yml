@@ -43,6 +43,20 @@ jobs:
       - name: Record resolved Swift package versions
         run: find . -name Package.resolved -not -path './build/*' -print -exec cat {} \;
 
+      # Health Hub unit tests (StrandiOSTests/Hub, host-less) on a simulator. Runs BEFORE the device
+      # build so a red test never produces an attested IPA. The simulator is picked at run time
+      # (first available iPhone) because runner images change their device list.
+      - name: Hub unit tests (iOS simulator)
+        run: |
+          set -euo pipefail
+          DEVICES=$(xcrun simctl list devices available)
+          LINE=$(printf '%s\n' "$DEVICES" | grep -E '^[[:space:]]+iPhone' | sed -n 1p || true)
+          UDID=$(printf '%s\n' "$LINE" | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' || true)
+          test -n "$UDID" || { echo "::error::no available iPhone simulator"; printf '%s\n' "$DEVICES"; exit 1; }
+          echo "Simulator: $LINE"
+          xcodebuild test -scheme NOOPiOSHubTests -destination "id=$UDID" \
+            -derivedDataPath build/dd-tests CODE_SIGNING_ALLOWED=NO
+
       # Release, not Debug: a Debug build carries get-task-allow and fails re-signed sideload (#53).
       - name: Build NOOPiOS for device (unsigned, Release)
         run: >-
