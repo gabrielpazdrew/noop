@@ -40,6 +40,8 @@ struct HubSettingsView: View {
                 .toggleStyle(.switch)
                 .tint(StrandPalette.accent)
                 .onChange(of: enabled) { _, on in
+                    // load() copying the stored value in is not a user switch: no prompts, no rewrite.
+                    guard on != state.enabled else { return }
                     state.enabled = on
                     if on { HubNotifications.requestAuthorization(); HubSteps.requestAuthorizationIfNeeded() }
                     HubNotifications.refresh(state: state)

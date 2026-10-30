@@ -69,8 +69,9 @@ enum HubStepsCore {
     static let historyLimit: TimeInterval = 7 * 24 * 3600
 
     /// The windows for the last `dayCount` local days, oldest first, cut at LOCAL midnight in
-    /// `calendar`'s time zone. Day lengths follow the calendar, so DST days are 23 h or 25 h.
-    static func windows(now: Date, calendar: Calendar) -> [HubStepWindow] {
+    /// `calendar`'s time zone (Gregorian whatever the device calendar). Day lengths follow the calendar, so DST days are 23 h or 25 h.
+    static func windows(now: Date, calendar deviceCalendar: Calendar) -> [HubStepWindow] {
+        let calendar = gregorian(in: deviceCalendar.timeZone)
         var out: [HubStepWindow] = []
         var dayStart = calendar.startOfDay(for: now)
         var dayEnd = now
@@ -88,9 +89,17 @@ enum HubStepsCore {
         return out.reversed()
     }
 
-    /// `YYYY-MM-DD` of `date` in `calendar`'s time zone (Gregorian digits, locale-independent).
+    /// The Gregorian calendar in `timeZone`. Day labels must be Gregorian `YYYY-MM-DD` (R3) even when the
+    /// phone is set to a Buddhist, Japanese or other calendar (which would give e.g. `2569-10-29`).
+    static func gregorian(in timeZone: TimeZone) -> Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = timeZone
+        return c
+    }
+
+    /// Gregorian `YYYY-MM-DD` of `date` in `calendar`'s time zone (only the time zone is used).
     static func label(_ date: Date, calendar: Calendar) -> String {
-        let c = calendar.dateComponents([.year, .month, .day], from: date)
+        let c = gregorian(in: calendar.timeZone).dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
@@ -117,10 +126,25 @@ enum HubStepsCore {
         return HubStepsSnapshot(status: .ok, days: days, timeZone: timeZone)
     }
 
+    /// How long `read` waits for CoreMotion before returning what it has. Whether CoreMotion answers
+    /// promptly on a locked phone or in a Bluetooth-wake window is unproven (G5), and a missing answer
+    /// must never stall the whole upload.
+    static let defaultDeadline: TimeInterval = 5
+
+    /// Runs a closure after a delay. Injected so tests can fire the deadline by hand.
+    typealias Scheduler = (TimeInterval, @escaping () -> Void) -> Void
+    static let dispatchAfter: Scheduler = { delay, work in
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     /// Reads the snapshot. Never queries (so never prompts) unless access is already authorized.
-    /// `completion` runs once, on whichever thread delivered the last result (synchronously when
-    /// the source answers synchronously or the read is blocked).
+    /// `completion` runs exactly once: when every day has answered, or at `deadline`, whichever is first.
+    /// At the deadline the days that haven't answered are left out (never zero-filled); if none answered
+    /// the status is `.error`. Answers arriving after completion are ignored. `completion` runs on
+    /// whichever thread delivered the last answer or the timer (synchronously when the source answers
+    /// synchronously or the read is blocked).
     static func read(source: HubPedometerSource, now: Date, calendar: Calendar,
+                     deadline: TimeInterval = defaultDeadline, schedule: Scheduler = dispatchAfter,
                      completion: @escaping (HubStepsSnapshot) -> Void) {
         let tz = calendar.timeZone.identifier
         if let blocked = blockingStatus(available: source.isStepCountingAvailable, authorization: source.authorization) {
@@ -132,16 +156,36 @@ enum HubStepsCore {
         let lock = NSLock()
         var results = [HubPedometerTotals?](repeating: nil, count: ws.count)
         var remaining = ws.count
+        var finished = false
+        /// Under the lock: marks the read finished and returns a copy of the results, or nil if it
+        /// already finished. The snapshot is built from that copy, so nothing touches it afterwards.
+        func finishLocked() -> [HubPedometerTotals?]? {
+            if finished { return nil }
+            finished = true
+            return results
+        }
         for (i, w) in ws.enumerated() {
             source.query(from: w.start, to: w.end) { totals in
                 lock.lock()
-                results[i] = totals
-                remaining -= 1
-                let done = remaining == 0
-                let snapshot = done ? results : []
+                var copy: [HubPedometerTotals?]?
+                if !finished {
+                    results[i] = totals
+                    remaining -= 1
+                    if remaining == 0 { copy = finishLocked() }
+                }
                 lock.unlock()
-                if done { completion(assemble(windows: ws, results: snapshot, timeZone: tz)) }
+                if let copy { completion(assemble(windows: ws, results: copy, timeZone: tz)) }
             }
+        }
+        lock.lock()
+        let alreadyDone = finished
+        lock.unlock()
+        guard !alreadyDone else { return }
+        schedule(deadline) {
+            lock.lock()
+            let copy = finishLocked()
+            lock.unlock()
+            if let copy { completion(assemble(windows: ws, results: copy, timeZone: tz)) }
         }
     }
 }

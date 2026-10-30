@@ -176,6 +176,135 @@ final class HubStepsTests: XCTestCase {
         XCTAssertEqual(snap?.days, [])
     }
 
+    // MARK: non-Gregorian device calendars (R3: labels are always Gregorian YYYY-MM-DD)
+
+    func testBuddhistOrJapaneseCalendarStillGetsGregorianLabels() {
+        for id in [Calendar.Identifier.buddhist, .japanese, .hebrew] {
+            var c = Calendar(identifier: id)
+            c.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+            let now = local(cal("America/Los_Angeles"), 2026, 10, 29, 12)
+            let ws = HubStepsCore.windows(now: now, calendar: c)
+            XCTAssertEqual(ws.last?.date, "2026-10-29", "\(id)")
+            XCTAssertEqual(ws.first?.date, "2026-10-23", "\(id)")
+            let p = FakePedometer()
+            for w in ws { p.answers[String(Int(w.start.timeIntervalSince1970))] = HubPedometerTotals(steps: 1, distanceM: nil, floorsAscended: nil) }
+            let snap = readSync(p, now: now, calendar: c)
+            XCTAssertEqual(snap?.days.last?.date, "2026-10-29", "\(id)")
+            XCTAssertEqual(snap?.timeZone, "America/Los_Angeles")
+        }
+    }
+
+    // MARK: deadline (a CoreMotion answer that never comes must not stall the upload)
+
+    /// Answers only the listed windows; the rest never call back (until `answerLate` is used).
+    private final class SilentPedometer: HubPedometerSource {
+        var isStepCountingAvailable = true
+        var authorization = HubStepsAuthorization.authorized
+        var answerDates: Set<Int> = []                  // window index → answered immediately
+        var pending: [(Int, (HubPedometerTotals?) -> Void)] = []
+        private var n = 0
+        func query(from start: Date, to end: Date, completion: @escaping (HubPedometerTotals?) -> Void) {
+            let i = n; n += 1
+            if answerDates.contains(i) { completion(HubPedometerTotals(steps: 100 + i, distanceM: nil, floorsAscended: nil)) }
+            else { pending.append((i, completion)) }
+        }
+    }
+
+    /// A scheduler the test fires by hand.
+    private final class ManualTimer {
+        var delay: TimeInterval?
+        var fire: (() -> Void)?
+        func schedule(_ d: TimeInterval, _ f: @escaping () -> Void) { delay = d; fire = f }
+    }
+
+    func testDeadlineReturnsTheDaysThatAnsweredAndIgnoresLateOnes() {
+        let c = cal("America/Los_Angeles")
+        let now = local(c, 2026, 10, 29, 12)
+        let p = SilentPedometer()
+        p.answerDates = [0, 3, 6]
+        let t = ManualTimer()
+        var calls = 0
+        var out: HubStepsSnapshot?
+        HubStepsCore.read(source: p, now: now, calendar: c, deadline: 5, schedule: t.schedule) { out = $0; calls += 1 }
+        XCTAssertNil(out, "must wait for the missing days until the deadline")
+        XCTAssertEqual(t.delay, 5)
+        t.fire?()
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(out?.status, .ok)
+        XCTAssertEqual(out?.days.map(\.date), ["2026-10-23", "2026-10-26", "2026-10-29"])
+        XCTAssertEqual(out?.days.map(\.steps), [100, 103, 106])
+        let returned = out
+        for (_, late) in p.pending { late(HubPedometerTotals(steps: 0, distanceM: nil, floorsAscended: nil)) }
+        t.fire?()
+        XCTAssertEqual(calls, 1, "late answers and a second timer fire never complete twice")
+        XCTAssertEqual(out, returned)
+    }
+
+    func testDeadlineWithNothingAnsweredIsAnError() {
+        let c = cal("America/Los_Angeles")
+        let p = SilentPedometer()
+        let t = ManualTimer()
+        var out: [HubStepsSnapshot] = []
+        HubStepsCore.read(source: p, now: local(c, 2026, 10, 29, 12), calendar: c, deadline: 5, schedule: t.schedule) { out.append($0) }
+        XCTAssertEqual(out.count, 0)
+        t.fire?()
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out.first?.status.rawValue, "error")
+        XCTAssertEqual(out.first?.days, [])
+    }
+
+    func testAllAnsweredBeforeDeadlineCompletesOnceAndTimerIsHarmless() {
+        let c = cal("America/Los_Angeles")
+        let p = SilentPedometer()
+        p.answerDates = Set(0..<7)
+        let t = ManualTimer()
+        var calls = 0
+        HubStepsCore.read(source: p, now: local(c, 2026, 10, 29, 12), calendar: c, deadline: 5, schedule: t.schedule) { _ in calls += 1 }
+        XCTAssertEqual(calls, 1)
+        t.fire?()
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testDefaultDeadlineIsAboutFiveSeconds() {
+        XCTAssertEqual(HubStepsCore.defaultDeadline, 5)
+    }
+
+    // MARK: concurrent CoreMotion callbacks
+
+    private final class ConcurrentPedometer: HubPedometerSource {
+        var isStepCountingAvailable = true
+        var authorization = HubStepsAuthorization.authorized
+        func query(from start: Date, to end: Date, completion: @escaping (HubPedometerTotals?) -> Void) {
+            let steps = Int(start.timeIntervalSince1970) % 100_000
+            DispatchQueue.global().asyncAfter(deadline: .now() + .microseconds(Int.random(in: 0...3000))) {
+                completion(HubPedometerTotals(steps: steps, distanceM: nil, floorsAscended: nil))
+            }
+        }
+    }
+
+    func testConcurrentOutOfOrderAnswersCompleteOnceWithRowsInPlace() {
+        let c = cal("America/Los_Angeles")
+        let now = local(c, 2026, 11, 3, 10)
+        let expected = HubStepsCore.windows(now: now, calendar: c).map { Int($0.start.timeIntervalSince1970) % 100_000 }
+        let lock = NSLock()
+        for _ in 0..<200 {
+            let done = DispatchSemaphore(value: 0)
+            var calls = 0
+            var snap: HubStepsSnapshot?
+            HubStepsCore.read(source: ConcurrentPedometer(), now: now, calendar: c, deadline: 30,
+                              schedule: { d, f in DispatchQueue.global().asyncAfter(deadline: .now() + d, execute: f) }) { s in
+                lock.lock(); calls += 1; snap = s; lock.unlock()
+                done.signal()
+            }
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+            Thread.sleep(forTimeInterval: 0.004)   // room for any stray second completion
+            lock.lock()
+            XCTAssertEqual(calls, 1)
+            XCTAssertEqual(snap?.days.map(\.steps), expected)
+            lock.unlock()
+        }
+    }
+
     func testStatusWireValues() {
         XCTAssertEqual([HubStepsStatus.ok, .denied, .unavailable, .notDetermined, .error].map(\.rawValue),
                        ["ok", "denied", "unavailable", "not_determined", "error"])

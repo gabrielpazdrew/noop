@@ -33,8 +33,10 @@ enum HubSteps {
 
     /// Daily totals for the last 7 local days (today so far + 6 before), cut at local midnight in the
     /// device's current time zone. Never prompts: when Motion access hasn't been decided yet the result
-    /// is `.notDetermined` with no rows. T4.1 calls this on every upload.
-    static func snapshot(now: Date = Date(), calendar: Calendar = .current) async -> HubStepsSnapshot {
+    /// is `.notDetermined` with no rows. Returns within `HubStepsCore.defaultDeadline` (5 s) even if
+    /// CoreMotion never answers; days without an answer are left out. T4.1 calls this on every upload.
+    static func snapshot(now: Date = Date(),
+                         calendar: Calendar = HubStepsCore.gregorian(in: .current)) async -> HubStepsSnapshot {
         await withCheckedContinuation { (cont: CheckedContinuation<HubStepsSnapshot, Never>) in
             HubStepsCore.read(source: CoreMotionSource(), now: now, calendar: calendar) { cont.resume(returning: $0) }
         }
@@ -49,7 +51,8 @@ enum HubSteps {
         pedometer.queryPedometerData(from: now.addingTimeInterval(-60), to: now) { _, _ in }
     }
     #else
-    static func snapshot(now: Date = Date(), calendar: Calendar = .current) async -> HubStepsSnapshot {
+    static func snapshot(now: Date = Date(),
+                         calendar: Calendar = HubStepsCore.gregorian(in: .current)) async -> HubStepsSnapshot {
         HubStepsSnapshot(status: .unavailable, days: [], timeZone: calendar.timeZone.identifier)
     }
     static func requestAuthorizationIfNeeded() {}
