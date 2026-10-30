@@ -141,7 +141,7 @@ enum HubNoticePlanner {
                              fireAt: fireAt)
         case .hubLocked:
             return HubNotice(kind: kind, title: "Hub locked",
-                             body: "Your hub is refusing uploads because it is locked. Unlock it from the Mac.",
+                             body: "Your hub is locked. Uploads still land, but Claude and Duet can't read it until it is unlocked; only Gabriel can unlock it from the Mac.",
                              fireAt: fireAt)
         case .tripwire:
             return HubNotice(kind: kind, title: "Hub tripwire",

@@ -113,7 +113,7 @@ struct HubSettingsView: View {
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
                 }
                 if state.locked {
-                    Text("The hub is locked and refusing uploads. Unlock it from the Mac.")
+                    Text("The hub is locked. Uploads still land; only Gabriel can unlock it from the Mac.")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
                 }
                 if state.openAlerts > 0 {

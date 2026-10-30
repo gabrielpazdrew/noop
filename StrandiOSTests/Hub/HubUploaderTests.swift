@@ -1236,4 +1236,56 @@ final class HubUploaderTests: XCTestCase {
         _ = run(e, .manual, at: now + 24 * 3600 + 120)
         XCTAssertFalse(sentBad())                                  // acked now: not sent again
     }
+
+    // MARK: final fix round (R46)
+
+    /// A hub response over 64 KB is a failed upload: nothing parsed, nothing applied.
+    func testOversizedHubResponseIsAFailedUploadAndChangesNothing() {
+        XCTAssertEqual(HubClient.maxResponseBytes, 64 * 1024)
+        func padded(_ size: Int) -> Data {
+            var d = Data(#"{"ack":{},"locked":true,"open_alerts":7,"server_time":1}"#.utf8)
+            d.append(Data(repeating: 0x20, count: size - d.count))   // trailing spaces: still valid JSON
+            return d
+        }
+        XCTAssertEqual(HubClient.classify(status: 200, body: padded(64 * 1024)),
+                       .acked(HubServerResponse(ack: [:], locked: true, renewalEstimate: nil, openAlerts: 7, serverTime: 1, tripwire: nil)))
+        XCTAssertEqual(HubClient.classify(status: 200, body: padded(64 * 1024 + 1)), .failed(.badResponse))
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        tr.respond = { _ in (200, padded(64 * 1024 + 1)) }
+        XCTAssertEqual(run(engine(src, tr), at: dayStart + 700), .failed(.badResponse))
+        XCTAssertEqual(marks.load().stream, [:])
+        XCTAssertFalse(state.locked)
+        XCTAssertEqual(state.openAlerts, 0)
+        XCTAssertEqual(state.lastUploadOK, false)
+    }
+
+    /// A server renewal estimate outside [now − 30 d, now + 8 d] is ignored (the embedded profile date
+    /// decides), so a broken or hostile server can't push the renewal notice out of sight.
+    func testServerRenewalEstimateOutsideSaneRangeIsIgnored() {
+        let now = dayStart + 3600
+        func estimate(_ v: Int) -> Date? {
+            let st = HubState(defaults: defaults)
+            HubUploadEngine.applyServerState(HubServerResponse(ack: [:], locked: false, renewalEstimate: v, openAlerts: 0,
+                                                               serverTime: nil, tripwire: nil), to: st, now: now)
+            return st.serverRenewalEstimate
+        }
+        XCTAssertEqual(estimate(now + 8 * 86_400), Date(timeIntervalSince1970: TimeInterval(now + 8 * 86_400)))
+        XCTAssertNil(estimate(now + 8 * 86_400 + 1))
+        XCTAssertEqual(estimate(now - 30 * 86_400), Date(timeIntervalSince1970: TimeInterval(now - 30 * 86_400)))
+        XCTAssertNil(estimate(now - 30 * 86_400 - 1))
+        // Through a real run: a far-future estimate from the server leaves the renewal date to the profile.
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        tr.respond = { FakeTransport.ackAll($0, renewal: now + 365 * 86_400) }
+        _ = run(engine(src, tr), at: now)
+        XCTAssertNil(state.serverRenewalEstimate)
+    }
+
+    /// While locked the hub still accepts uploads (SPEC §6.6): the notice must not say uploads are refused.
+    func testLockedNoticeDoesNotClaimUploadsAreRefused() {
+        let n = HubNoticePlanner.notice(.hubLocked, fireAt: Date(timeIntervalSince1970: TimeInterval(dayStart)), renewalEstimate: nil)
+        XCTAssertFalse(n.body.lowercased().contains("refus"))
+        XCTAssertTrue(n.body.contains("only Gabriel can unlock it from the Mac"))
+    }
 }

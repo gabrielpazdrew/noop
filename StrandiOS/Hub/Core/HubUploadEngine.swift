@@ -402,7 +402,7 @@ actor HubUploadEngine {
                 if !chunk.isResend {
                     for (s, rs) in chunk.ranges { if let last = rs.last { cursor[s] = last.upperBound + 1 } }
                 }
-                Self.applyServerState(resp, to: state)
+                Self.applyServerState(resp, to: state, now: Int(now().timeIntervalSince1970))
                 state.recordUploadSuccess(at: now())
                 sent += 1
                 marks.save(w)
@@ -464,8 +464,15 @@ actor HubUploadEngine {
         return true
     }
 
-    static func applyServerState(_ r: HubServerResponse, to state: HubState) {
-        state.serverRenewalEstimate = r.renewalEstimate.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+    /// R46: a server renewal estimate is trusted only within [now − 30 days, now + 8 days] (a profile lasts
+    /// 7 days); outside it the embedded profile date decides, so a broken or hostile server can't move the
+    /// renewal notice out of sight.
+    static let renewalEstimateAhead = 8 * 86_400
+    static let renewalEstimateBehind = 30 * 86_400
+
+    static func applyServerState(_ r: HubServerResponse, to state: HubState, now: Int) {
+        let est = r.renewalEstimate.flatMap { $0 <= now + renewalEstimateAhead && $0 >= now - renewalEstimateBehind ? $0 : nil }
+        state.serverRenewalEstimate = est.map { Date(timeIntervalSince1970: TimeInterval($0)) }
         if state.locked != r.locked { state.locked = r.locked }
         if state.openAlerts != r.openAlerts { state.openAlerts = r.openAlerts }
         if let t = r.tripwire, state.tripwire != t { state.tripwire = t }

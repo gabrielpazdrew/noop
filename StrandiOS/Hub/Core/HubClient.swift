@@ -136,7 +136,12 @@ struct HubClient {
         }
     }
 
+    /// R46: a hub answer is a few hundred bytes. Anything over 64 KB is not parsed and counts as a failed
+    /// upload (nothing applied: no watermark, no state change).
+    static let maxResponseBytes = 64 * 1024
+
     static func classify(status: Int, body: Data) -> HubSendResult {
+        if body.count > maxResponseBytes { return .failed(.badResponse) }
         switch status {
         case 200..<300:
             guard let r = parse(body) else { return .failed(.badResponse) }
