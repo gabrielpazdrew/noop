@@ -32,11 +32,18 @@ struct HubDailyInput: Equatable {
 struct HubSleepInput: Equatable {
     var startTs: Int
     var endTs: Int
+    /// As NOOP stores it: usually a 0–1 fraction, a percentage on some imported rows.
     var efficiency: Double?
     var restingHr: Int?
     var avgHrv: Double?
     var startTsAdjusted: Int?
     var userEdited: Bool
+    /// Asleep minutes decoded by NOOP itself (`SleepView.decodeStages/decodeSegments`), computed on the
+    /// phone; only this total leaves it, never the stages. nil = no decodable stages.
+    var asleepMin: Double? = nil
+    /// NOOP's own main-night grouping (`SleepView.mainNightGroup`). nil = not known: the builder's
+    /// fallback rule decides.
+    var isMain: Bool? = nil
 }
 
 enum HubBatchBuilder {
@@ -88,19 +95,33 @@ enum HubBatchBuilder {
 
     // MARK: daily, sleep, steps
 
+    /// R22: efficiency travels as a 0–1 fraction. NOOP's column is bimodal (its own scores are fractions,
+    /// some imports percentages; `SleepView.efficiencyPct` reads it the same way): > 1 is a percentage.
+    /// Clamped to 0…1; nil or non-finite → nil.
+    static func efficiencyFraction(_ e: Double?) -> Double? {
+        guard let e, e.isFinite else { return nil }
+        return Swift.min(1, Swift.max(0, e > 1 ? e / 100 : e))
+    }
+
+    /// NOOP's `skinTempDevC` is bimodal too: CSV/Apple imports put an ABSOLUTE wrist °C there.
+    /// Same threshold as NOOP's `VitalBands.isAbsoluteSkinTemp` (>= 20 °C); an absolute is never sent as a deviation.
+    static let absoluteSkinTempFloor = 20.0
+
     static func daily(_ d: HubDailyInput) -> HubDailyRow {
         HubDailyRow(day: d.day, recovery: d.recovery, strain: d.strain, restingHr: d.restingHr,
                     avgHrv: d.avgHrv, avgSdnn: d.avgSdnn, respRateBpm: d.respRateBpm,
-                    skinTempDevC: d.skinTempDevC, totalSleepMin: d.totalSleepMin, efficiency: d.efficiency,
+                    skinTempDevC: d.skinTempDevC.flatMap { $0 >= absoluteSkinTempFloor ? nil : $0 },
+                    totalSleepMin: d.totalSleepMin, efficiency: efficiencyFraction(d.efficiency),
                     disturbances: d.disturbances, exerciseCount: d.exerciseCount, steps: d.steps,
                     activeKcalEst: d.activeKcalEst)
     }
 
-    /// Sleep rows. `local_day` = local day the session STARTED (contract). `total_min` = in-bed minutes
-    /// (from the effective onset) × efficiency, null without an efficiency: computed from totals only,
-    /// never from stage data. `is_nap`: per local END day (NOOP's attribution), the longest session and
-    /// every session chained to it by gaps of at most 90 minutes form the main night (0); every other
-    /// session that day is a nap (1).
+    /// Sleep rows. `local_day` = local day the session STARTED (contract). `total_min` = NOOP's own
+    /// decoded asleep minutes when the adapter has them; otherwise in-bed minutes (from the effective onset)
+    /// × the efficiency FRACTION (R22); null when neither exists. `efficiency` is sent as a fraction.
+    /// `is_nap` = not in NOOP's main-night group when the adapter supplies `isMain`; otherwise the
+    /// fallback: per local END day, the longest session and every session chained to it by gaps of at most
+    /// 90 minutes form the main night (0), every other session that day is a nap (1).
     static func sleep(_ sessions: [HubSleepInput], timeZone: TimeZone) -> [HubSleepRow] {
         let sorted = sessions.sorted { $0.startTs < $1.startTs }
         var byEndDay: [String: [HubSleepInput]] = [:]
@@ -124,10 +145,12 @@ enum HubBatchBuilder {
         }
         return sorted.map { s in
             let inBedMin = Double(Swift.max(0, s.endTs - effStart(s))) / 60.0
+            let frac = efficiencyFraction(s.efficiency)
+            let isMain = s.isMain ?? mainStarts.contains(s.startTs)
             return HubSleepRow(startTs: s.startTs, endTs: s.endTs, localDay: localDay(s.startTs, timeZone),
-                               totalMin: s.efficiency.map { inBedMin * $0 / 100.0 },
-                               efficiency: s.efficiency, restingHr: s.restingHr, avgHrv: s.avgHrv,
-                               isNap: mainStarts.contains(s.startTs) ? 0 : 1,
+                               totalMin: s.asleepMin ?? frac.map { inBedMin * $0 },
+                               efficiency: frac, restingHr: s.restingHr, avgHrv: s.avgHrv,
+                               isNap: isMain ? 0 : 1,
                                startTsAdjusted: s.startTsAdjusted, userEdited: s.userEdited ? 1 : 0)
         }
     }
@@ -151,6 +174,17 @@ enum HubBatchBuilder {
         let c = calendar(tz).dateComponents([.year, .month, .day], from: Date(timeIntervalSince1970: TimeInterval(ts)))
         return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
     }
+
+    /// First second of the local day containing `ts`.
+    static func startOfLocalDay(_ ts: Int, _ tz: TimeZone) -> Int {
+        Int(calendar(tz).startOfDay(for: Date(timeIntervalSince1970: TimeInterval(ts))).timeIntervalSince1970)
+    }
+
+    /// Segments are hours cut additionally at local midnight (identical to hours in whole-hour zones).
+    /// Every fingerprint mark and every range the uploader reads starts on a segment start, so no part of
+    /// an hour that straddles midnight (half-hour zones) can fall between two requests.
+    static func segmentStart(_ ts: Int, _ tz: TimeZone) -> Int { Swift.max(floorHour(ts), startOfLocalDay(ts, tz)) }
+    static func segmentEnd(_ start: Int, _ tz: TimeZone) -> Int { Swift.min(floorHour(start) + 3_599, endOfLocalDay(start, tz)) }
 
     /// Last second of the local day containing `ts` (DST-correct: days can be 23 or 25 hours).
     static func endOfLocalDay(_ ts: Int, _ tz: TimeZone) -> Int {

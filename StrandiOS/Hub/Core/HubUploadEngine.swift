@@ -12,21 +12,26 @@ struct HubRunContext {
     var daily: [HubDailyInput]
     var sleep: [HubSleepInput]
     var steps: [HubStepRow]
+    /// True while the strap's history offload is running (`LiveState.backfilling`). NOOP writes live rows
+    /// at "now" during an offload, so the band streams (HR, events, battery) are held: sending them would
+    /// move their watermarks past history that hasn't landed yet. Daily, sleep, steps and status still go.
+    var holdStreams: Bool = false
 }
 
 protocol HubDataSource: AnyObject {
     /// nil when the store isn't open yet (the run is skipped, nothing changes).
     func context(now: Int) async -> HubRunContext?
-    /// Rows with `from <= ts <= to`, oldest first.
-    func hrSamples(from: Int, to: Int) async -> [HubHRSampleInput]
-    func events(from: Int, to: Int) async -> [HubEventInput]
-    func battery(from: Int, to: Int) async -> [HubBatteryInput]
+    /// Rows with `from <= ts <= to`, oldest first. A read that fails THROWS (never an empty answer):
+    /// the run then fails and nothing is marked as sent.
+    func hrSamples(from: Int, to: Int) async throws -> [HubHRSampleInput]
+    func events(from: Int, to: Int) async throws -> [HubEventInput]
+    func battery(from: Int, to: Int) async throws -> [HubBatteryInput]
     /// The oldest row time in [from, to] for that stream, or nil when there is none.
-    func firstTs(_ s: HubStream, from: Int, to: Int) async -> Int?
+    func firstTs(_ s: HubStream, from: Int, to: Int) async throws -> Int?
     /// For each range: row count + newest ts in it (exactly the rows the read above returns, e.g. HR
     /// measured ∪ PPG-derived). Must change whenever a row is added to that range. One call per stream
-    /// and step, so the adapter can answer many hours with a single store read.
-    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async -> [HubFingerprint]
+    /// and step, so the adapter can answer many segments with a single store read.
+    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async throws -> [HubFingerprint]
 }
 
 enum HubTrigger: String { case backfill, foreground, manual }
@@ -69,15 +74,20 @@ actor HubUploadEngine {
         self.afterAttempt = afterAttempt
     }
 
-    /// Pure throttle: manual runs always; otherwise once per 10 minutes unless the last run left a
-    /// catch-up unfinished (more than a day behind, or out of background time).
-    static func shouldRun(trigger: HubTrigger, now: Int, lastAttemptAt: Int?, catchUpPending: Bool) -> Bool {
+    /// Pure throttle. Manual runs always go. Otherwise once per 10 minutes, except:
+    /// - the last run left a catch-up unfinished (out of background time, or the per-run cap);
+    /// - a backfill whose data landed after the last attempt started (the offload a foreground run
+    ///   itself kicked off must not wait for the next Bluetooth wake).
+    static func shouldRun(trigger: HubTrigger, now: Int, lastAttemptAt: Int?, catchUpPending: Bool,
+                          dataLandedAt: Int? = nil) -> Bool {
         if trigger == .manual || catchUpPending { return true }
         guard let last = lastAttemptAt else { return true }
+        if trigger == .backfill, let landed = dataLandedAt, landed > last { return true }
         return now - last >= minInterval || now < last
     }
 
-    func run(_ trigger: HubTrigger, now: @escaping () -> Date = Date.init,
+    /// `dataLandedAt`: for a `.backfill` trigger, when the offload completed (`LiveState.lastSyncedAt`).
+    func run(_ trigger: HubTrigger, now: @escaping () -> Date = Date.init, dataLandedAt: Int? = nil,
              shouldContinue: @escaping () -> Bool = { true }) async -> HubRunOutcome {
         guard !running else { return .skipped("already running") }
         guard state.enabled else { return .skipped("hub off") }
@@ -89,12 +99,28 @@ actor HubUploadEngine {
         let nowTs = Int(now().timeIntervalSince1970)
         var w = marks.load()
         guard Self.shouldRun(trigger: trigger, now: nowTs, lastAttemptAt: w.lastAttemptAt,
-                             catchUpPending: w.catchUpPending) else { return .skipped("throttled") }
+                             catchUpPending: w.catchUpPending, dataLandedAt: dataLandedAt) else { return .skipped("throttled") }
         guard let ctx = await source.context(now: nowTs) else { return .skipped("store not ready") }
         w.lastAttemptAt = nowTs
         marks.save(w)
 
+        do {
+            return try await send(trigger: trigger, ctx: ctx, base: base, nowTs: nowTs, now: now,
+                                  shouldContinue: shouldContinue, w: &w)
+        } catch {
+            // A store read failed: nothing in this request was sent, nothing advances. Counted as a failed
+            // upload so a persistent read problem reaches the 6-hour notice like any other failure.
+            state.recordUploadFailure(at: now(), reason: HubFailure.storeRead.reason)
+            marks.save(w)
+            afterAttempt()
+            return .failed(.storeRead)
+        }
+    }
+
+    private func send(trigger: HubTrigger, ctx: HubRunContext, base: URL, nowTs: Int, now: @escaping () -> Date,
+                      shouldContinue: @escaping () -> Bool, w: inout HubWatermarks) async throws -> HubRunOutcome {
         let tz = ctx.timeZone
+        let streams: [HubStream] = ctx.holdStreams ? [] : HubStream.allCases
         // Keyed tables: rows whose hash differs from the acked one.
         var pendingDaily = ctx.daily.map(HubBatchBuilder.daily).filter {
             w.rowHash(.daily, $0.day) != HubWire.rowHash(HubWire.daily($0))
@@ -102,60 +128,71 @@ actor HubUploadEngine {
         var pendingSleep = HubBatchBuilder.sleep(ctx.sleep, timeZone: tz).filter {
             w.rowHash(.sleep, String($0.startTs)) != HubWire.rowHash(HubWire.sleep($0))
         }
-        // Streams: acked hours whose fingerprint changed since (late backfill).
+        // Streams: acked segments whose fingerprint changed since (late backfill). Late rows only arrive
+        // through a strap offload, so the scan runs for a backfill (and "Upload now"), not every foreground.
         var dirty: [HubStream: [Int]] = [:]
-        for s in HubStream.allCases {
-            guard let wm = w.streamMark(s) else { continue }
-            let stop = HubBatchBuilder.floorHour(wm)
-            let hours = Array(stride(from: HubBatchBuilder.floorHour(nowTs - Self.hourLookback), to: stop, by: 3_600))
-            let clips = hours.map { w.hourMark(s, $0)?.clip ?? ($0 + 3_599) }
-            let fps = hours.isEmpty ? [] : await source.fingerprints(s, ranges: zip(hours, clips).map { $0...$1 })
-            for (i, h) in hours.enumerated() where i < fps.count {
-                let fp = fps[i]
-                if let mark = w.hourMark(s, h) {
-                    if fp != mark.fp { dirty[s, default: []].append(h) }
-                } else if fp.count == 0 {
-                    w.setHourMark(s, h, HubHourMark(clip: clips[i], fp: fp))   // nothing there, nothing to send
-                } else {
-                    dirty[s, default: []].append(h)
+        if trigger != .foreground {
+            for s in streams {
+                guard let wm = w.streamMark(s) else { continue }
+                let stop = HubBatchBuilder.segmentStart(wm, tz)
+                var segs: [Int] = []
+                var t = HubBatchBuilder.segmentStart(nowTs - Self.hourLookback, tz)
+                while t < stop { segs.append(t); t = HubBatchBuilder.segmentEnd(t, tz) + 1 }
+                let clips = segs.map { w.hourMark(s, $0)?.clip ?? HubBatchBuilder.segmentEnd($0, tz) }
+                let fps = segs.isEmpty ? [] : try await source.fingerprints(s, ranges: zip(segs, clips).map { $0...$1 })
+                for (i, seg) in segs.enumerated() where i < fps.count {
+                    let fp = fps[i]
+                    if let mark = w.hourMark(s, seg) {
+                        if fp != mark.fp { dirty[s, default: []].append(seg) }
+                    } else if fp.count == 0 {
+                        w.setHourMark(s, seg, HubHourMark(clip: clips[i], fp: fp))   // nothing there, nothing to send
+                    } else {
+                        dirty[s, default: []].append(seg)
+                    }
                 }
             }
         }
         var cursor: [HubStream: Int] = [:]
-        for s in HubStream.allCases {
-            cursor[s] = w.streamMark(s).map(HubBatchBuilder.floorHour)
-                ?? HubBatchBuilder.floorHour(nowTs - Self.initialLookback)
+        for s in streams {
+            cursor[s] = w.streamMark(s).map { HubBatchBuilder.segmentStart($0, tz) }
+                ?? HubBatchBuilder.segmentStart(nowTs - Self.initialLookback, tz)
         }
 
         var sent = 0
-        var forwardDone = false
+        var forwardDone = streams.isEmpty
         while sent < Self.maxRequestsPerRun {
             guard shouldContinue() else {
                 w.catchUpPending = true; marks.save(w)
                 return sent > 0 ? .uploaded(requests: sent, more: true) : .cancelled
             }
-            // Plan: late-backfilled hours first (one local day per request), then the forward scan.
+            // Switched off, or pointed elsewhere, mid-run: stop before the next request.
+            if sent > 0 && (!state.enabled || state.hubURL != base) {
+                w.catchUpPending = false; marks.save(w)
+                afterAttempt()
+                return .uploaded(requests: sent, more: true)
+            }
+            // Plan: late-backfilled segments first (one local day per request), then the forward scan.
             var chunk = HubChunk()
             if let first = dirty.values.compactMap({ $0.min() }).min() {
                 let dayEnd = HubBatchBuilder.endOfLocalDay(first, tz)
                 chunk.isResend = true
-                for s in HubStream.allCases {
-                    let hours = (dirty[s] ?? []).filter { $0 <= dayEnd }
+                for s in streams {
+                    let segs = (dirty[s] ?? []).filter { $0 <= dayEnd }
                     dirty[s] = (dirty[s] ?? []).filter { $0 > dayEnd }
-                    if !hours.isEmpty {
-                        chunk.ranges[s] = hours.sorted().map { $0...Swift.min($0 + 3_599, dayEnd, nowTs) }
+                    if !segs.isEmpty {
+                        chunk.ranges[s] = segs.sorted().map { $0...Swift.min(HubBatchBuilder.segmentEnd($0, tz), nowTs) }
                     }
                 }
             } else if !forwardDone {
                 var firsts: [HubStream: Int] = [:]
-                for s in HubStream.allCases {
+                for s in streams {
                     let from = cursor[s]!
-                    if from <= nowTs, let f = await source.firstTs(s, from: from, to: nowTs) { firsts[s] = f }
+                    if from <= nowTs, let f = try await source.firstTs(s, from: from, to: nowTs) { firsts[s] = f }
                 }
                 if let earliest = firsts.values.min() {
                     let dayEnd = Swift.min(HubBatchBuilder.endOfLocalDay(earliest, tz), nowTs)
                     for (s, f) in firsts where f <= dayEnd {
-                        chunk.ranges[s] = [HubBatchBuilder.floorHour(f)...dayEnd]
+                        chunk.ranges[s] = [Swift.max(HubBatchBuilder.segmentStart(f, tz), cursor[s]!)...dayEnd]
                     }
                 } else {
                     forwardDone = true
@@ -166,27 +203,30 @@ actor HubUploadEngine {
             if chunk.isEmpty && sent > 0 && pendingDaily.isEmpty && pendingSleep.isEmpty { break }
 
             // Fingerprint BEFORE reading rows: a row landing in between makes the stored mark stale, which
-            // only ever causes a harmless resend later, never a skipped row.
+            // only ever causes a harmless resend later, never a skipped row. Marks are per segment.
             var hourMarks: [HubStream: [(Int, HubHourMark)]] = [:]
             for (s, rs) in chunk.ranges {
                 var spans: [ClosedRange<Int>] = []
                 for r in rs {
-                    for h in stride(from: r.lowerBound, through: r.upperBound, by: 3_600) {
-                        spans.append(h...Swift.min(h + 3_599, r.upperBound))
+                    var t = r.lowerBound
+                    while t <= r.upperBound {
+                        let e = Swift.min(HubBatchBuilder.segmentEnd(t, tz), r.upperBound)
+                        spans.append(t...e)
+                        t = e + 1
                     }
                 }
-                let fps = spans.isEmpty ? [] : await source.fingerprints(s, ranges: spans)
+                let fps = spans.isEmpty ? [] : try await source.fingerprints(s, ranges: spans)
                 hourMarks[s] = zip(spans, fps).map { ($0.lowerBound, HubHourMark(clip: $0.upperBound, fp: $1)) }
             }
             var payload = HubPayload(device: ctx.device)
             for r in chunk.ranges[.hr_minute] ?? [] {
-                payload.hrMinute += HubBatchBuilder.minuteAggregates(await source.hrSamples(from: r.lowerBound, to: r.upperBound))
+                payload.hrMinute += HubBatchBuilder.minuteAggregates(try await source.hrSamples(from: r.lowerBound, to: r.upperBound))
             }
             for r in chunk.ranges[.events] ?? [] {
-                payload.events += HubBatchBuilder.events(await source.events(from: r.lowerBound, to: r.upperBound))
+                payload.events += HubBatchBuilder.events(try await source.events(from: r.lowerBound, to: r.upperBound))
             }
             for r in chunk.ranges[.battery] ?? [] {
-                payload.battery += HubBatchBuilder.battery(await source.battery(from: r.lowerBound, to: r.upperBound))
+                payload.battery += HubBatchBuilder.battery(try await source.battery(from: r.lowerBound, to: r.upperBound))
             }
             payload.daily = Array(pendingDaily.prefix(Self.maxKeyedRowsPerRequest))
             payload.sleep = Array(pendingSleep.prefix(Self.maxKeyedRowsPerRequest))

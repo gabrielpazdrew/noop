@@ -50,7 +50,13 @@ enum HubUploader {
         // Foreground: effectively unlimited. Background: stop starting new requests 8 s before iOS's deadline.
         let remaining = app.backgroundTimeRemaining
         let deadline = remaining > 1e6 ? Date.distantFuture : Date().addingTimeInterval(remaining - 8)
-        let work = Task { await engine.run(trigger, shouldContinue: { !flag.isSet && Date() < deadline }) }
+        // For a backfill: when the offload's data landed, so the run isn't throttled by a foreground run
+        // that started before it (that foreground is what kicked the offload off).
+        let landed = AppModel.shared?.live.lastSyncedAt.map { Int($0) }
+        let work = Task {
+            await engine.run(trigger, dataLandedAt: trigger == .backfill ? landed : nil,
+                             shouldContinue: { !flag.isSet && Date() < deadline })
+        }
         box.work = work
         let outcome = await work.value
         box.end()
@@ -77,12 +83,19 @@ final class HubTaskBox {
     }
 }
 
+/// A store read that couldn't be answered (store not open, or the read threw). The run fails; nothing
+/// is marked as sent.
+struct HubStoreReadError: Error {}
+
 /// HubDataSource over NOOP's Repository. Reads the same id union the dashboard reads for HR (active strap
 /// + canonical history), the active strap for events and battery (they belong to the strap that sent
 /// them), and the dashboard's merged daily rows and sleep sessions. Only contract columns are copied out.
+/// Store reads happen on the store's own actor; merging and bucketing run off the main actor.
 @MainActor
 final class HubRepositorySource: HubDataSource {
     private var model: AppModel? { AppModel.shared }
+    /// NOOP's learned habitual midsleep (the Sleep tab's main-night pick uses it), cached for an hour.
+    private var midsleep: (value: Int?, at: Date)?
 
     func context(now: Int) async -> HubRunContext? {
         guard let model, await model.repo.storeHandle() != nil else { return nil }
@@ -105,46 +118,63 @@ final class HubRepositorySource: HubDataSource {
                           efficiency: $0.efficiency, disturbances: $0.disturbances,
                           exerciseCount: $0.exerciseCount, steps: $0.steps, activeKcalEst: $0.activeKcalEst)
         }
-        let sleep = model.repo.sleeps.map {
-            HubSleepInput(startTs: $0.startTs, endTs: $0.endTs, efficiency: $0.efficiency, restingHr: $0.restingHr,
-                          avgHrv: $0.avgHrv, startTsAdjusted: $0.startTsAdjusted, userEdited: $0.userEdited)
-        }
+        let sleep = await sleepInputs(model.repo.sleeps, tz: tz)
         return HubRunContext(device: device, timeZone: tz, daily: daily, sleep: sleep,
-                             steps: HubBatchBuilder.steps(steps))
+                             steps: HubBatchBuilder.steps(steps),
+                             holdStreams: model.live.backfilling)
     }
 
-    func hrSamples(from: Int, to: Int) async -> [HubHRSampleInput] {
-        await hrUnion(from: from, to: to, limit: 200_000)
+    /// Sleep sessions with NOOP's own asleep minutes (decoded from the stored stages ON THE PHONE; only the
+    /// total leaves it) and NOOP's own main-night grouping per local end day (the Sleep tab's rule).
+    private func sleepInputs(_ sessions: [CachedSleepSession], tz: TimeZone) async -> [HubSleepInput] {
+        if midsleep == nil || Date().timeIntervalSince(midsleep!.at) > 3_600 {
+            midsleep = (await model?.repo.habitualMidsleepSec(), Date())
+        }
+        let habitual = midsleep?.value
+        var mainStarts = Set<Int>()
+        let byEndDay = Dictionary(grouping: sessions) { HubBatchBuilder.localDay($0.endTs, tz) }
+        for (_, day) in byEndDay {
+            for s in SleepView.mainNightGroup(day, habitualMidsleepSec: habitual) { mainStarts.insert(s.startTs) }
+        }
+        return sessions.map { s in
+            let asleep = SleepView.decodeStages(s.stagesJSON)?.asleep
+                ?? SleepView.decodeSegments(s.stagesJSON, sessionStart: s.effectiveStartTs)?.stages.asleep
+            return HubSleepInput(startTs: s.startTs, endTs: s.endTs, efficiency: s.efficiency, restingHr: s.restingHr,
+                                 avgHrv: s.avgHrv, startTsAdjusted: s.startTsAdjusted, userEdited: s.userEdited,
+                                 asleepMin: asleep, isMain: mainStarts.contains(s.startTs))
+        }
     }
 
-    func events(from: Int, to: Int) async -> [HubEventInput] {
-        guard let a = await activeStore() else { return [] }
-        let (store, id) = a
-        let rows = (try? await store.events(deviceId: id, from: from, to: to, limit: 100_000)) ?? []
+    func hrSamples(from: Int, to: Int) async throws -> [HubHRSampleInput] {
+        try await hrUnion(from: from, to: to, limit: 200_000)
+    }
+
+    func events(from: Int, to: Int) async throws -> [HubEventInput] {
+        let (store, id) = try await activeStore()
+        let rows = try await store.events(deviceId: id, from: from, to: to, limit: 100_000)
         return rows.filter { HubBatchBuilder.eventWhitelist.contains($0.kind) }.map { HubEventInput(ts: $0.ts, kind: $0.kind) }
     }
 
-    func battery(from: Int, to: Int) async -> [HubBatteryInput] {
-        guard let a = await activeStore() else { return [] }
-        let (store, id) = a
+    func battery(from: Int, to: Int) async throws -> [HubBatteryInput] {
+        let (store, id) = try await activeStore()
         // NOOP's battery read projects ts, soc, mv; `charging` stays null (charging on/off travel as events).
-        let rows = (try? await store.batterySamples(deviceId: id, from: from, to: to, limit: 100_000)) ?? []
+        let rows = try await store.batterySamples(deviceId: id, from: from, to: to, limit: 100_000)
         return rows.map { HubBatteryInput(ts: $0.ts, soc: $0.soc, mv: $0.mv, charging: $0.charging) }
     }
 
-    func firstTs(_ s: HubStream, from: Int, to: Int) async -> Int? {
+    func firstTs(_ s: HubStream, from: Int, to: Int) async throws -> Int? {
         switch s {
         case .hr_minute:
-            return await hrUnion(from: from, to: to, limit: 1).first?.ts
+            return try await hrUnion(from: from, to: to, limit: 1).first?.ts
         case .battery:
-            return await battery(from: from, to: to).first?.ts
+            let (store, id) = try await activeStore()
+            return try await store.batterySamples(deviceId: id, from: from, to: to, limit: 1).first?.ts
         case .events:
             // Page through non-whitelisted kinds (BLE link events etc.) to the first sendable one.
-            guard let a = await activeStore() else { return nil }
-            let (store, id) = a
+            let (store, id) = try await activeStore()
             var lo = from
             while lo <= to {
-                let page = (try? await store.events(deviceId: id, from: lo, to: to, limit: 1_000)) ?? []
+                let page = try await store.events(deviceId: id, from: lo, to: to, limit: 1_000)
                 if let hit = page.first(where: { HubBatchBuilder.eventWhitelist.contains($0.kind) }) { return hit.ts }
                 guard page.count == 1_000, let last = page.last?.ts else { return nil }
                 lo = last + 1
@@ -153,41 +183,53 @@ final class HubRepositorySource: HubDataSource {
         }
     }
 
-    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async -> [HubFingerprint] {
+    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async throws -> [HubFingerprint] {
         guard let lo = ranges.map(\.lowerBound).min(), let hi = ranges.map(\.upperBound).max() else { return [] }
         // One read over the whole span, bucketed per range: same rows the uploader would send.
         let ts: [Int]
         switch s {
-        case .hr_minute: ts = await hrUnion(from: lo, to: hi, limit: 400_000).map(\.ts)
-        case .events: ts = await events(from: lo, to: hi).map(\.ts)
-        case .battery: ts = await battery(from: lo, to: hi).map(\.ts)
+        case .hr_minute: ts = try await hrUnion(from: lo, to: hi, limit: 400_000).map(\.ts)
+        case .events: ts = try await events(from: lo, to: hi).map(\.ts)
+        case .battery: ts = try await battery(from: lo, to: hi).map(\.ts)
         }
-        return ranges.map { r in
-            var c = 0, m = 0
-            for t in ts where r.contains(t) { c += 1; m = max(m, t) }
-            return HubFingerprint(count: c, maxTs: m)
-        }
+        return await Task.detached(priority: .utility) { Self.bucket(ts, ranges) }.value
     }
 
     // MARK: helpers
 
-    private func activeStore() async -> (WhoopStore, String)? {
-        guard let repo = model?.repo, let store = await repo.storeHandle() else { return nil }
+    nonisolated static func bucket(_ ts: [Int], _ ranges: [ClosedRange<Int>]) -> [HubFingerprint] {
+        let sorted = ts.sorted()
+        return ranges.map { r in
+            // Binary search for the first ts >= lowerBound, then count through upperBound.
+            var lo = 0, hi = sorted.count
+            while lo < hi { let mid = (lo + hi) / 2; if sorted[mid] < r.lowerBound { lo = mid + 1 } else { hi = mid } }
+            var c = 0, m = 0, i = lo
+            while i < sorted.count && sorted[i] <= r.upperBound { c += 1; m = sorted[i]; i += 1 }
+            return HubFingerprint(count: c, maxTs: m)
+        }
+    }
+
+    nonisolated static func mergeHR(_ lists: [[HRSample]], limit: Int) -> [HubHRSampleInput] {
+        var byTs: [Int: Int] = [:]
+        for list in lists { for s in list where byTs[s.ts] == nil { byTs[s.ts] = s.bpm } }   // active strap first
+        let sorted = byTs.keys.sorted()
+        return (limit < sorted.count ? Array(sorted.prefix(limit)) : sorted).map { HubHRSampleInput(ts: $0, bpm: byTs[$0]!) }
+    }
+
+    private func activeStore() async throws -> (WhoopStore, String) {
+        guard let repo = model?.repo, let store = await repo.storeHandle() else { throw HubStoreReadError() }
         return (store, repo.deviceId)
     }
 
     /// HR over the dashboard's imported read union (active strap first, canonical history), measured ∪
     /// PPG-derived per id (WhoopStore.hrSamples), deduped by second with the active strap winning.
-    private func hrUnion(from: Int, to: Int, limit: Int) async -> [HubHRSampleInput] {
-        guard let repo = model?.repo, let store = await repo.storeHandle() else { return [] }
-        var byTs: [Int: Int] = [:]
+    private func hrUnion(from: Int, to: Int, limit: Int) async throws -> [HubHRSampleInput] {
+        guard let repo = model?.repo, let store = await repo.storeHandle() else { throw HubStoreReadError() }
+        var lists: [[HRSample]] = []
         for id in repo.importedReadIds {
-            for s in (try? await store.hrSamples(deviceId: id, from: from, to: to, limit: limit)) ?? [] where byTs[s.ts] == nil {
-                byTs[s.ts] = s.bpm
-            }
+            lists.append(try await store.hrSamples(deviceId: id, from: from, to: to, limit: limit))
         }
-        let sorted = byTs.keys.sorted()
-        return (limit < sorted.count ? Array(sorted.prefix(limit)) : sorted).map { HubHRSampleInput(ts: $0, bpm: byTs[$0]!) }
+        return await Task.detached(priority: .utility) { Self.mergeHR(lists, limit: limit) }.value
     }
 }
 #endif

@@ -34,6 +34,7 @@ enum HubFailure: Equatable {
     case network(String)
     case badResponse
     case encoding
+    case storeRead
 
     /// Short, content-free text for HubState / the Settings screen.
     var reason: String {
@@ -48,6 +49,7 @@ enum HubFailure: Equatable {
         case .network(let what): return what
         case .badResponse: return "Unreadable hub response"
         case .encoding: return "Could not build the batch"
+        case .storeRead: return "Could not read NOOP's data"
         }
     }
 }
@@ -63,7 +65,16 @@ protocol HubTransport {
     func post(_ request: URLRequest) async throws -> (status: Int, body: Data)
 }
 
-/// URLSession, ephemeral: no cookies, no cache, no credential storage.
+/// Refuses every HTTP redirect, so a 3xx comes back as a plain `HTTP 3xx` failure instead of being
+/// followed (a followed redirect could carry the bearer token to another URL, e.g. an Access login page).
+final class HubRedirectBlocker: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
+/// URLSession, ephemeral: no cookies, no cache, no credential storage, no redirects.
 struct URLSessionHubTransport: HubTransport {
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -78,7 +89,7 @@ struct URLSessionHubTransport: HubTransport {
     }()
 
     func post(_ request: URLRequest) async throws -> (status: Int, body: Data) {
-        let (data, resp) = try await Self.session.data(for: request)
+        let (data, resp) = try await Self.session.data(for: request, delegate: HubRedirectBlocker())
         return ((resp as? HTTPURLResponse)?.statusCode ?? 0, data)
     }
 }

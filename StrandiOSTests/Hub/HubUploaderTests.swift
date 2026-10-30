@@ -5,6 +5,8 @@ import XCTest
 
 // MARK: - fakes
 
+struct FakeReadError: Error {}
+
 final class FakeHubSource: HubDataSource {
     var hr: [HubHRSampleInput] = []
     var ev: [HubEventInput] = []
@@ -13,19 +15,33 @@ final class FakeHubSource: HubDataSource {
     var sleep: [HubSleepInput] = []
     var steps: [HubStepRow] = []
     var stepsStatus = "ok"
+    var holdStreams = false
+    /// Row reads (not fingerprints) throw while this is set.
+    var failRowReads = false
+    var fingerprintCalls = 0
     var tz = TimeZone(identifier: "America/Los_Angeles")!
 
     func context(now: Int) async -> HubRunContext? {
         HubRunContext(device: HubDevice(appVersion: "12.0.0-hub.1", build: "1200", bandFw: "41.16.6.0",
                                         bandBattery: 81.5, embeddedExpiry: 1_896_379_200, tz: tz.identifier,
                                         stepsStatus: stepsStatus),
-                      timeZone: tz, daily: daily, sleep: sleep, steps: steps)
+                      timeZone: tz, daily: daily, sleep: sleep, steps: steps, holdStreams: holdStreams)
     }
-    func hrSamples(from: Int, to: Int) async -> [HubHRSampleInput] { hr.filter { $0.ts >= from && $0.ts <= to } }
-    func events(from: Int, to: Int) async -> [HubEventInput] { ev.filter { $0.ts >= from && $0.ts <= to } }
-    func battery(from: Int, to: Int) async -> [HubBatteryInput] { bat.filter { $0.ts >= from && $0.ts <= to } }
-    func firstTs(_ s: HubStream, from: Int, to: Int) async -> Int? { tss(s).filter { $0 >= from && $0 <= to }.min() }
-    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async -> [HubFingerprint] {
+    func hrSamples(from: Int, to: Int) async throws -> [HubHRSampleInput] {
+        if failRowReads { throw FakeReadError() }
+        return hr.filter { $0.ts >= from && $0.ts <= to }
+    }
+    func events(from: Int, to: Int) async throws -> [HubEventInput] {
+        if failRowReads { throw FakeReadError() }
+        return ev.filter { $0.ts >= from && $0.ts <= to }
+    }
+    func battery(from: Int, to: Int) async throws -> [HubBatteryInput] {
+        if failRowReads { throw FakeReadError() }
+        return bat.filter { $0.ts >= from && $0.ts <= to }
+    }
+    func firstTs(_ s: HubStream, from: Int, to: Int) async throws -> Int? { tss(s).filter { $0 >= from && $0 <= to }.min() }
+    func fingerprints(_ s: HubStream, ranges: [ClosedRange<Int>]) async throws -> [HubFingerprint] {
+        fingerprintCalls += 1
         let all = tss(s)
         return ranges.map { r in
             let inR = all.filter { r.contains($0) }
@@ -123,8 +139,10 @@ final class HubUploaderTests: XCTestCase {
                                afterAttempt: { attempts?.n += 1 })
     }
 
-    func run(_ e: HubUploadEngine, _ trig: HubTrigger = .manual, at now: Int, shouldContinue: @escaping () -> Bool = { true }) -> HubRunOutcome {
-        blocking { await e.run(trig, now: { Date(timeIntervalSince1970: TimeInterval(now)) }, shouldContinue: shouldContinue) }
+    func run(_ e: HubUploadEngine, _ trig: HubTrigger = .manual, at now: Int, dataLandedAt: Int? = nil,
+             shouldContinue: @escaping () -> Bool = { true }) -> HubRunOutcome {
+        blocking { await e.run(trig, now: { Date(timeIntervalSince1970: TimeInterval(now)) }, dataLandedAt: dataLandedAt,
+                               shouldContinue: shouldContinue) }
     }
 
     /// One sample every `step` seconds over [from, to), bpm = 60 + (ts / 60) % 40.
@@ -165,7 +183,8 @@ final class HubUploaderTests: XCTestCase {
     }
 
     func testNapRuleAndSleepTotals() {
-        let night = HubSleepInput(startTs: dayStart - 3 * 3600, endTs: dayStart + 4 * 3600, efficiency: 90,
+        // NOOP stores efficiency as a 0–1 fraction (AnalyticsEngine); some imports carry a percentage.
+        let night = HubSleepInput(startTs: dayStart - 3 * 3600, endTs: dayStart + 4 * 3600, efficiency: 0.9,
                                   restingHr: 55, avgHrv: 70, startTsAdjusted: nil, userEdited: false)
         let fragment = HubSleepInput(startTs: dayStart + 4 * 3600 + 30 * 60, endTs: dayStart + 6 * 3600,
                                      efficiency: nil, restingHr: nil, avgHrv: nil, startTsAdjusted: nil, userEdited: false)
@@ -174,10 +193,39 @@ final class HubUploaderTests: XCTestCase {
         let rows = HubBatchBuilder.sleep([nap, fragment, night], timeZone: tz)
         XCTAssertEqual(rows.map(\.isNap), [0, 0, 1])
         XCTAssertEqual(rows[0].localDay, "2030-01-14")   // started the evening before
-        XCTAssertEqual(rows[0].totalMin, 420 * 0.9)
+        XCTAssertEqual(rows[0].totalMin, 378)              // 7 h in bed × 0.9, not 3.78
+        XCTAssertEqual(rows[0].efficiency, 0.9)
         XCTAssertNil(rows[1].totalMin)
-        XCTAssertEqual(rows[2].totalMin, 24)
+        XCTAssertEqual(rows[2].totalMin, 24)               // a percentage (80) is read as 0.8
+        XCTAssertEqual(rows[2].efficiency, 0.8)            // R22: the wire carries a fraction
         XCTAssertEqual(rows[2].userEdited, 1)
+    }
+
+    func testSleepTotalPrefersNOOPsDecodedAsleepMinutesAndMainNightFlag() {
+        var s = HubSleepInput(startTs: dayStart, endTs: dayStart + 8 * 3600, efficiency: 0.95, restingHr: nil,
+                              avgHrv: nil, startTsAdjusted: nil, userEdited: false)
+        s.asleepMin = 401.5
+        s.isMain = false              // NOOP's own grouping says nap, even though it is the day's longest
+        let row = HubBatchBuilder.sleep([s], timeZone: tz)[0]
+        XCTAssertEqual(row.totalMin, 401.5)
+        XCTAssertEqual(row.isNap, 1)
+    }
+
+    func testEfficiencyIsAFractionOnTheWire() {
+        XCTAssertEqual(HubBatchBuilder.efficiencyFraction(0.912), 0.912)
+        XCTAssertEqual(HubBatchBuilder.efficiencyFraction(91.2)!, 0.912, accuracy: 1e-12)
+        XCTAssertEqual(HubBatchBuilder.efficiencyFraction(1), 1)
+        XCTAssertEqual(HubBatchBuilder.efficiencyFraction(150), 1)
+        XCTAssertEqual(HubBatchBuilder.efficiencyFraction(-3), 0)
+        XCTAssertNil(HubBatchBuilder.efficiencyFraction(nil))
+        XCTAssertNil(HubBatchBuilder.efficiencyFraction(.nan))
+        var d = HubDailyInput(day: "2030-01-15", recovery: nil, strain: nil, restingHr: nil, avgHrv: nil, avgSdnn: nil,
+                              respRateBpm: nil, skinTempDevC: 0.3, totalSleepMin: nil, efficiency: 91.2,
+                              disturbances: nil, exerciseCount: nil, steps: nil, activeKcalEst: nil)
+        XCTAssertEqual(HubBatchBuilder.daily(d).efficiency!, 0.912, accuracy: 1e-12)
+        XCTAssertEqual(HubBatchBuilder.daily(d).skinTempDevC, 0.3)
+        d.skinTempDevC = 33.4        // an import's ABSOLUTE wrist °C in the deviation column: never sent as a deviation
+        XCTAssertNil(HubBatchBuilder.daily(d).skinTempDevC)
     }
 
     // MARK: privacy + contract
@@ -261,6 +309,9 @@ final class HubUploaderTests: XCTestCase {
                     XCTAssertEqual(Set(row.keys), fixtureKeys, "\(name).\(table)[\(i)] keys")
                     XCTAssertEqual(Set(row.keys), Set(contractTypes[table]!.keys), "\(name).\(table)[\(i)] vs table")
                     for (k, t) in contractTypes[table]! { check(row[k] as Any, t, "\(name).\(table)[\(i)].\(k)") }
+                    if let e = row["efficiency"] as? Double {   // R22: a 0–1 fraction
+                        XCTAssertTrue(e >= 0 && e <= 1, "\(name).\(table)[\(i)].efficiency \(e) is not a 0–1 fraction (R22)")
+                    }
                 }
             }
         }
@@ -485,5 +536,150 @@ final class HubUploaderTests: XCTestCase {
         w.prune(hoursBefore: 7200, keepRowKeys: [.daily: []])
         XCTAssertNil(w.hourMark(.events, 3600))
         XCTAssertEqual(w.rows["daily"], [:])
+    }
+
+    // MARK: fix round 1
+
+    /// Review Important 3: the phone was away from the band for 3 days. On reconnect live rows land at
+    /// "now" while the offload is still writing the 3 days. Streams are held during the offload, so the
+    /// watermark can't jump past the backfill; afterwards every backfilled minute is sent.
+    func testThreeDayGapBackfilledDuringLiveStreamIsSentInFull() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let t0 = dayStart - 3 * 86_400 + 8 * 3600       // last upload before the gap
+        src.hr = hrSeries(t0 - 3600, t0)
+        _ = run(e, at: t0 + 60)
+        let before = marks.load().streamMark(.hr_minute)!
+        let now = dayStart + 10 * 3600
+        // Reconnect: live rows at now, offload still running with only the oldest day written so far.
+        src.hr += hrSeries(now - 1200, now)
+        src.hr += hrSeries(t0, t0 + 86_400)
+        src.bat = [HubBatteryInput(ts: now - 60, soc: 40, mv: nil, charging: nil)]
+        src.holdStreams = true
+        tr.bodies.removeAll()
+        let held = run(e, .foreground, at: now)
+        XCTAssertEqual(held, .uploaded(requests: 1, more: false))
+        XCTAssertEqual(marks.load().streamMark(.hr_minute), before)        // not advanced past the backfill
+        XCTAssertNil(marks.load().streamMark(.battery))
+        XCTAssertEqual(minutes(tr.bodies), [])                            // streams not sent while held
+        XCTAssertNotNil(tr.bodies[0]["device"])                           // status/steps still go
+        // The offload finishes: the whole gap is in the store.
+        src.hr += hrSeries(t0 + 86_400, now - 1200)
+        src.holdStreams = false
+        tr.bodies.removeAll()
+        _ = run(e, .backfill, at: now + 30, dataLandedAt: now + 25)
+        let sent = Set(minutes(tr.bodies))
+        let want = Set(HubBatchBuilder.minuteAggregates(src.hr.filter { $0.ts > before }).map(\.t))
+        XCTAssertTrue(want.isSubset(of: sent), "\(want.subtracting(sent).count) backfilled minutes never sent")
+    }
+
+    /// Review Important 4: a failed store read fails the run; nothing is marked acked, nothing advances,
+    /// and the failure counts toward the 6-hour notice.
+    func testStoreReadFailureFailsTheRunAndLosesNothing() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 18 * 3600
+        src.hr = hrSeries(dayStart + 10 * 3600, dayStart + 13 * 3600) + hrSeries(dayStart + 15 * 3600, now)
+        _ = run(e, at: now)
+        let w0 = marks.load()
+        let hole = hrSeries(dayStart + 13 * 3600, dayStart + 15 * 3600)
+        src.hr += hole
+        src.failRowReads = true
+        tr.bodies.removeAll()
+        XCTAssertEqual(run(e, .backfill, at: now + 700, dataLandedAt: now + 690), .failed(.storeRead))
+        XCTAssertEqual(tr.requests.count, 1)                // nothing new was posted
+        XCTAssertEqual(marks.load().stream, w0.stream)
+        // No segment holding rows got a new or changed mark (marks for segments seen EMPTY are harmless:
+        // a row landing there later changes the fingerprint and is resent).
+        let nonEmpty = { (w: HubWatermarks) in w.hours.mapValues { $0.filter { $0.value.fp.count > 0 } } }
+        XCTAssertEqual(nonEmpty(marks.load()), nonEmpty(w0))
+        XCTAssertEqual(state.lastUploadOK, false)
+        XCTAssertNotNil(state.failingSince)
+        src.failRowReads = false
+        _ = run(e, .backfill, at: now + 1400, dataLandedAt: now + 1390)
+        let holeMinutes = Set(HubBatchBuilder.minuteAggregates(hole).map(\.t))
+        XCTAssertTrue(holeMinutes.isSubset(of: Set(minutes(tr.bodies))))
+    }
+
+    /// Review Minor 5: in a half-hour zone an hour straddles local midnight; both halves of a backfilled
+    /// hole in that hour are resent, and every request stays within one local day.
+    func testHalfHourZoneHoleAcrossMidnightIsResentInFull() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.tz = TimeZone(identifier: "Asia/Kolkata")!       // UTC+5:30
+        let e = engine(src, tr)
+        let midnight = 1_894_645_800                          // 2030-01-15 00:00 IST = 18:30 UTC
+        let now = midnight + 6 * 3600
+        let holeFrom = midnight - 1800, holeTo = midnight + 1800     // 11:30 pm → 12:30 am IST
+        src.hr = hrSeries(midnight - 5 * 3600, holeFrom) + hrSeries(holeTo, now)
+        _ = run(e, at: now)
+        src.hr += hrSeries(holeFrom, holeTo)
+        tr.bodies.removeAll()
+        _ = run(e, .backfill, at: now + 700, dataLandedAt: now + 690)
+        let want = Set(HubBatchBuilder.minuteAggregates(hrSeries(holeFrom, holeTo)).map(\.t))
+        XCTAssertEqual(want.subtracting(Set(minutes(tr.bodies))).count, 0)
+        for body in tr.bodies {
+            let ts = (body["hr_minute"] as! [[String: Any]]).map { $0["t"] as! Int }
+            XCTAssertTrue(Set(ts.map { HubBatchBuilder.localDay($0, src.tz) }).count <= 1)
+        }
+    }
+
+    /// Review Minor 6: the 48 h late-backfill scan runs when new history can have landed (a backfill, or
+    /// "Upload now"), not on every foreground.
+    func testLateScanRunsOnBackfillAndManualOnly() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 18 * 3600
+        src.hr = hrSeries(dayStart + 10 * 3600, now)
+        _ = run(e, at: now)
+        src.fingerprintCalls = 0
+        _ = run(e, .foreground, at: now + 700)
+        let foregroundCalls = src.fingerprintCalls
+        src.fingerprintCalls = 0
+        _ = run(e, .backfill, at: now + 1400, dataLandedAt: now + 1390)
+        XCTAssertTrue(src.fingerprintCalls > foregroundCalls, "backfill \(src.fingerprintCalls) vs foreground \(foregroundCalls)")
+        XCTAssertEqual(foregroundCalls, 1)     // only the marks for what is being sent (HR only here)
+    }
+
+    /// Review Minor 8: switching the hub off (or changing its URL) stops a catch-up already running.
+    func testSwitchingOffStopsARunningCatchUp() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let now = dayStart + 12 * 3600
+        src.hr = stride(from: now - 5 * 86_400, to: now, by: 3600).map { HubHRSampleInput(ts: $0, bpm: 70) }
+        tr.respond = { j in self.state.enabled = false; return FakeTransport.ackAll(j) }
+        let out = run(engine(src, tr), at: now)
+        XCTAssertEqual(tr.requests.count, 1)
+        XCTAssertEqual(out, .uploaded(requests: 1, more: true))
+        state.enabled = true
+        let tr2 = FakeTransport()
+        tr2.respond = { j in self.state.hubURLString = "https://other.example.test"; return FakeTransport.ackAll(j) }
+        _ = run(engine(src, tr2), at: now + 10)
+        XCTAssertEqual(tr2.requests.count, 1)
+    }
+
+    /// Review Minor 10: the backfill a foreground kicks off is not held back by that foreground's run.
+    func testBackfillAfterAForegroundRunIsNotThrottled() {
+        XCTAssertTrue(HubUploadEngine.shouldRun(trigger: .backfill, now: 1_120, lastAttemptAt: 1_000,
+                                                catchUpPending: false, dataLandedAt: 1_100))
+        XCTAssertFalse(HubUploadEngine.shouldRun(trigger: .backfill, now: 1_120, lastAttemptAt: 1_000,
+                                                 catchUpPending: false, dataLandedAt: 990))
+        XCTAssertFalse(HubUploadEngine.shouldRun(trigger: .foreground, now: 1_120, lastAttemptAt: 1_000,
+                                                 catchUpPending: false, dataLandedAt: 1_100))
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        let e = engine(src, tr)
+        _ = run(e, .foreground, at: dayStart + 700)
+        if case .uploaded = run(e, .backfill, at: dayStart + 820, dataLandedAt: dayStart + 815) {} else { XCTFail("backfill throttled") }
+    }
+
+    /// Review Minor 9: a redirect is never followed (it would carry the bearer token elsewhere).
+    func testRedirectsAreRefused() {
+        let blocker = HubRedirectBlocker()
+        var followed: URLRequest? = URLRequest(url: URL(string: "https://example.test")!)
+        blocker.urlSession(URLSession.shared, task: URLSession.shared.dataTask(with: URL(string: "https://hub.example.test")!),
+                           willPerformHTTPRedirection: HTTPURLResponse(), newRequest: URLRequest(url: URL(string: "https://login.example.test")!)) {
+            followed = $0
+        }
+        XCTAssertNil(followed)
+        XCTAssertEqual(HubClient.classify(status: 302, body: Data()), .failed(.http(302)))
     }
 }
