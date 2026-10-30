@@ -1,7 +1,7 @@
 // Fork-only (phone-hub). GENERATED copy of hub/test/fixtures/phone_payload_v1.json (the R1 wire contract,
-// Health Analysis repo, commit e755f3f). Embedded rather than bundled so the host-less test target needs no
+// Health Analysis repo, commit 83bfbb9 "Phone hub T3.2 fix 1"). Embedded rather than bundled so the host-less test target needs no
 // resources. If the contract changes, regenerate this file; the local harness diffs it against the source.
-// R22 (2026-10-29): efficiency is a 0–1 fraction (0.912, 0.886); the hub fixture gets the same edit in T3.2's fix round.
+// R22 efficiency fractions and the R23 optional `sleep_window` included.
 enum HubContractFixture {
     static let phonePayloadV1 = #"""
 {
@@ -59,6 +59,7 @@ enum HubContractFixture {
       "user_edited": 0
     }
   ],
+  "sleep_window": { "from": 1894665600, "to": 1894752000 },
   "hr_minute": [
     { "t": 1894717800, "mean": 54.2, "min": 52, "max": 57, "n": 58 },
     { "t": 1894717860, "mean": 55.0, "min": 53, "max": 58, "n": 60 },

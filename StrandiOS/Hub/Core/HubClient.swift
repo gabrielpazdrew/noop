@@ -76,6 +76,11 @@ final class HubRedirectBlocker: NSObject, URLSessionTaskDelegate {
 
 /// URLSession, ephemeral: no cookies, no cache, no credential storage, no redirects.
 struct URLSessionHubTransport: HubTransport {
+    /// The actual network call; a seam so a test can see the delegate handed to URLSession.
+    var perform: (URLRequest, URLSessionTaskDelegate?) async throws -> (Data, URLResponse) = {
+        try await URLSessionHubTransport.session.data(for: $0, delegate: $1)
+    }
+
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -89,7 +94,7 @@ struct URLSessionHubTransport: HubTransport {
     }()
 
     func post(_ request: URLRequest) async throws -> (status: Int, body: Data) {
-        let (data, resp) = try await Self.session.data(for: request, delegate: HubRedirectBlocker())
+        let (data, resp) = try await perform(request, HubRedirectBlocker())
         return ((resp as? HTTPURLResponse)?.statusCode ?? 0, data)
     }
 }

@@ -99,6 +99,12 @@ struct HubSettingsView: View {
                     Text("Failing since \(since.formatted(date: .abbreviated, time: .shortened)).")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
                 }
+                if let since = state.holdingSince {
+                    Text(Date().timeIntervalSince(since) >= TimeInterval(HubHoldPolicy.cap)
+                         ? "Holding: strap sync pending since \(since.formatted(date: .abbreviated, time: .shortened)). Band data is being sent anyway."
+                         : "Holding band data while the strap syncs (since \(since.formatted(date: .omitted, time: .shortened))).")
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                }
                 if state.locked {
                     Text("The hub is locked and refusing uploads. Unlock it from the Mac.")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)

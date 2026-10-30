@@ -34,9 +34,26 @@ struct HubWatermarks: Codable, Equatable {
     var stream: [String: Int] = [:]
     var hours: [String: [String: HubHourMark]] = [:]
     var rows: [String: [String: String]] = [:]
+    /// R23: per sleep window (key = window `from`), the hash of the rows last confirmed by an ack.
+    var windows: [String: String] = [:]
     /// The last run stopped with chunks still to send (catch-up), so the 10-minute floor doesn't apply.
     var catchUpPending = false
     var lastAttemptAt: Int?
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey { case stream, hours, rows, windows, catchUpPending, lastAttemptAt }
+
+    /// Tolerant: a field added in a later build decodes as empty instead of dropping every watermark.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        stream = try c.decodeIfPresent([String: Int].self, forKey: .stream) ?? [:]
+        hours = try c.decodeIfPresent([String: [String: HubHourMark]].self, forKey: .hours) ?? [:]
+        rows = try c.decodeIfPresent([String: [String: String]].self, forKey: .rows) ?? [:]
+        windows = try c.decodeIfPresent([String: String].self, forKey: .windows) ?? [:]
+        catchUpPending = try c.decodeIfPresent(Bool.self, forKey: .catchUpPending) ?? false
+        lastAttemptAt = try c.decodeIfPresent(Int.self, forKey: .lastAttemptAt)
+    }
 
     func streamMark(_ s: HubStream) -> Int? { stream[s.rawValue] }
 
@@ -54,7 +71,8 @@ struct HubWatermarks: Codable, Equatable {
     }
 
     /// Drop hour marks older than `before` and row hashes for keys that are no longer in the window.
-    mutating func prune(hoursBefore before: Int, keepRowKeys: [HubTable: Set<String>]) {
+    mutating func prune(hoursBefore before: Int, keepRowKeys: [HubTable: Set<String>], windowsBefore: Int? = nil) {
+        if let wb = windowsBefore { windows = windows.filter { (Int($0.key) ?? 0) >= wb } }
         for (k, marks) in hours {
             hours[k] = marks.filter { (Int($0.key) ?? 0) >= before }
         }

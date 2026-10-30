@@ -15,9 +15,14 @@ final class FakeHubSource: HubDataSource {
     var sleep: [HubSleepInput] = []
     var steps: [HubStepRow] = []
     var stepsStatus = "ok"
-    var holdStreams = false
-    /// Row reads (not fingerprints) throw while this is set.
-    var failRowReads = false
+    var backfilling = false
+    var historyPendingSync = false
+    var lastBackfillingEndedAt: Int?
+    /// nil = "loaded iff there are sessions", like the adapter.
+    var sleepLoaded: Bool?
+    /// Row reads (not fingerprints) throw this while set.
+    var readError: Error?
+    var failRowReads: Bool { get { readError != nil } set { readError = newValue ? FakeReadError() : nil } }
     var fingerprintCalls = 0
     var tz = TimeZone(identifier: "America/Los_Angeles")!
 
@@ -25,18 +30,21 @@ final class FakeHubSource: HubDataSource {
         HubRunContext(device: HubDevice(appVersion: "12.0.0-hub.1", build: "1200", bandFw: "41.16.6.0",
                                         bandBattery: 81.5, embeddedExpiry: 1_896_379_200, tz: tz.identifier,
                                         stepsStatus: stepsStatus),
-                      timeZone: tz, daily: daily, sleep: sleep, steps: steps, holdStreams: holdStreams)
+                      timeZone: tz, daily: daily, sleep: sleep, steps: steps,
+                      sleepLoaded: sleepLoaded ?? !sleep.isEmpty,
+                      backfilling: backfilling, historyPendingSync: historyPendingSync,
+                      lastBackfillingEndedAt: lastBackfillingEndedAt)
     }
     func hrSamples(from: Int, to: Int) async throws -> [HubHRSampleInput] {
-        if failRowReads { throw FakeReadError() }
+        if let e = readError { throw e }
         return hr.filter { $0.ts >= from && $0.ts <= to }
     }
     func events(from: Int, to: Int) async throws -> [HubEventInput] {
-        if failRowReads { throw FakeReadError() }
+        if let e = readError { throw e }
         return ev.filter { $0.ts >= from && $0.ts <= to }
     }
     func battery(from: Int, to: Int) async throws -> [HubBatteryInput] {
-        if failRowReads { throw FakeReadError() }
+        if let e = readError { throw e }
         return bat.filter { $0.ts >= from && $0.ts <= to }
     }
     func firstTs(_ s: HubStream, from: Int, to: Int) async throws -> Int? { tss(s).filter { $0 >= from && $0 <= to }.min() }
@@ -245,6 +253,7 @@ final class HubUploaderTests: XCTestCase {
         p.battery = HubBatchBuilder.battery([HubBatteryInput(ts: dayStart, soc: 22, mv: 3620, charging: nil),
                                              HubBatteryInput(ts: dayStart + 60, soc: 23, mv: nil, charging: true)])
         p.steps = [HubStepRow(day: "2030-01-14", steps: 8423, distanceM: nil, flights: 7)]
+        p.sleepWindow = HubBatchBuilder.sleepWindow(containing: dayStart, tz)
         return p
     }
 
@@ -296,6 +305,22 @@ final class HubUploaderTests: XCTestCase {
         let mine = try! JSONSerialization.jsonObject(with: try! HubWire.encode(fullPayload())) as! [String: Any]
         XCTAssertEqual(Set(mine.keys), Set(fixture.keys))
         XCTAssertEqual(mine["schema"] as? Int, 1)
+        // R23: `sleep_window` is optional — present in the fixture, absent from a payload without a window.
+        var bare = fullPayload(); bare.sleepWindow = nil
+        let noWindow = try! JSONSerialization.jsonObject(with: try! HubWire.encode(bare)) as! [String: Any]
+        XCTAssertEqual(Set(noWindow.keys), Set(fixture.keys).subtracting(["sleep_window"]))
+        for (name, doc) in [("fixture", fixture), ("payload", mine)] {
+            guard let w = doc["sleep_window"] as? [String: Any] else { XCTFail("\(name) has no sleep_window"); continue }
+            XCTAssertEqual(Set(w.keys), ["from", "to"])
+            check(w["from"] as Any, "i", "\(name).sleep_window.from")
+            check(w["to"] as Any, "i", "\(name).sleep_window.to")
+            let from = (w["from"] as? Int) ?? 0, to = (w["to"] as? Int) ?? 0
+            XCTAssertTrue(from < to && to - from <= 691_200, "\(name).sleep_window span")
+            for r in doc["sleep"] as! [[String: Any]] {
+                let st = r["start_ts"] as! Int
+                XCTAssertTrue(st >= from && st < to, "\(name).sleep row outside its window")
+            }
+        }
         // The fixture itself satisfies the type table (guards the table against drift).
         for (name, doc) in [("fixture", fixture), ("payload", mine)] {
             let dev = doc["device"] as! [String: Any]
@@ -497,12 +522,14 @@ final class HubUploaderTests: XCTestCase {
         src.steps = [HubStepRow(day: "2030-01-15", steps: 100, distanceM: nil, flights: nil)]
         _ = run(engine(src, tr), at: dayStart + 36_000)
         XCTAssertEqual((tr.bodies[0]["daily"] as! [Any]).count, 3)
-        XCTAssertEqual((tr.bodies[0]["sleep"] as! [Any]).count, 1)
+        XCTAssertEqual(tr.bodies.flatMap { $0["sleep"] as! [Any] }.count, 1)
         src.daily[2] = d("2030-01-15", 71)     // today's recovery scored
         tr.bodies.removeAll()
         _ = run(engine(src, tr), at: dayStart + 37_000)
+        XCTAssertEqual(tr.bodies.count, 1)
         XCTAssertEqual((tr.bodies[0]["daily"] as! [[String: Any]]).map { $0["day"] as! String }, ["2030-01-15"])
         XCTAssertEqual((tr.bodies[0]["sleep"] as! [Any]).count, 0)
+        XCTAssertNil(tr.bodies[0]["sleep_window"])                         // unchanged window: not resent
         XCTAssertEqual((tr.bodies[0]["steps"] as! [Any]).count, 1)     // steps go every upload
     }
 
@@ -555,7 +582,7 @@ final class HubUploaderTests: XCTestCase {
         src.hr += hrSeries(now - 1200, now)
         src.hr += hrSeries(t0, t0 + 86_400)
         src.bat = [HubBatteryInput(ts: now - 60, soc: 40, mv: nil, charging: nil)]
-        src.holdStreams = true
+        src.backfilling = true
         tr.bodies.removeAll()
         let held = run(e, .foreground, at: now)
         XCTAssertEqual(held, .uploaded(requests: 1, more: false))
@@ -565,7 +592,7 @@ final class HubUploaderTests: XCTestCase {
         XCTAssertNotNil(tr.bodies[0]["device"])                           // status/steps still go
         // The offload finishes: the whole gap is in the store.
         src.hr += hrSeries(t0 + 86_400, now - 1200)
-        src.holdStreams = false
+        src.backfilling = false; src.lastBackfillingEndedAt = now + 20
         tr.bodies.removeAll()
         _ = run(e, .backfill, at: now + 30, dataLandedAt: now + 25)
         let sent = Set(minutes(tr.bodies))
@@ -681,5 +708,217 @@ final class HubUploaderTests: XCTestCase {
         }
         XCTAssertNil(followed)
         XCTAssertEqual(HubClient.classify(status: 302, body: Data()), .failed(.http(302)))
+    }
+
+    // MARK: fix round 2 — R23 sleep windows
+
+    func night(_ start: Int, hours: Int = 7) -> HubSleepInput {
+        HubSleepInput(startTs: start, endTs: start + hours * 3600, efficiency: 0.9, restingHr: 55, avgHrv: 70,
+                      startTsAdjusted: nil, userEdited: false)
+    }
+
+    func windows(_ bodies: [[String: Any]]) -> [(from: Int, to: Int, starts: [Int])] {
+        bodies.compactMap { b in
+            guard let w = b["sleep_window"] as? [String: Any] else { return nil }
+            return (w["from"] as! Int, w["to"] as! Int, (b["sleep"] as! [[String: Any]]).map { $0["start_ts"] as! Int })
+        }
+    }
+
+    func testReKeyedSessionReplacesItsDayWindow() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let s1 = dayStart - 5 * 3600                     // 7 pm the evening before (local day 2030-01-14)
+        src.sleep = [night(s1)]
+        _ = run(e, at: dayStart + 10 * 3600)
+        tr.bodies.removeAll()
+        src.sleep = [night(s1 + 1200)]                   // NOOP re-detected the onset 20 min later
+        _ = run(e, at: dayStart + 11 * 3600)
+        let ws = windows(tr.bodies)
+        XCTAssertEqual(ws.count, 1)
+        XCTAssertEqual(ws.first?.starts, [s1 + 1200])    // only the new key: the server supersedes the old one
+        XCTAssertEqual(ws.first?.from, HubBatchBuilder.startOfLocalDay(s1, tz))
+    }
+
+    func testDeletedSessionSendsAnEmptyWindow() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let s1 = dayStart - 5 * 3600, s2 = dayStart + 13 * 3600
+        src.sleep = [night(s1), night(s2, hours: 1)]
+        _ = run(e, at: dayStart + 16 * 3600)
+        tr.bodies.removeAll()
+        src.sleep = [night(s1)]                           // the nap was deleted in NOOP
+        let out = run(e, at: dayStart + 17 * 3600)
+        if case .uploaded = out {} else { XCTFail("\(out)") }
+        let ws = windows(tr.bodies)
+        XCTAssertEqual(ws.count, 1)
+        XCTAssertEqual(ws.first?.from, dayStart)
+        XCTAssertEqual(ws.first?.starts, [])
+        // Confirmed by the ack: an unchanged state sends nothing more.
+        tr.bodies.removeAll()
+        _ = run(e, at: dayStart + 18 * 3600)
+        XCTAssertEqual(windows(tr.bodies).count, 0)
+    }
+
+    func testStartMovedAcrossMidnightSendsBothWindows() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let s1 = dayStart - 600                           // 11:50 pm on the 14th
+        let older = night(dayStart - 3 * 86_400)          // NOOP's loaded list reaches further back
+        src.sleep = [older, night(s1)]
+        _ = run(e, at: dayStart + 10 * 3600)
+        tr.bodies.removeAll()
+        src.sleep = [older, night(dayStart + 600)]        // corrected to 12:10 am on the 15th
+        _ = run(e, at: dayStart + 11 * 3600)
+        let ws = windows(tr.bodies).sorted { $0.from < $1.from }
+        XCTAssertEqual(ws.map(\.from), [HubBatchBuilder.startOfLocalDay(s1, tz), dayStart])
+        XCTAssertEqual(ws.map(\.starts), [[], [dayStart + 600]])
+    }
+
+    func testWindowNotConfirmedWithoutAnAck() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        src.sleep = [night(dayStart - 5 * 3600)]
+        tr.respond = { _ in (503, Data("{\"code\":\"D1_ERROR\"}".utf8)) }
+        _ = run(e, at: dayStart + 10 * 3600)
+        tr.respond = { FakeTransport.ackAll($0) }
+        tr.bodies.removeAll()
+        _ = run(e, at: dayStart + 11 * 3600)
+        XCTAssertTrue(windows(tr.bodies).contains { $0.starts == [dayStart - 5 * 3600] })
+    }
+
+    func testRowsOutsideTheWindowAreRefusedLocally() {
+        var p = fullPayload()
+        p.sleepWindow = HubSleepWindow(from: dayStart + 86_400, to: dayStart + 2 * 86_400)   // row starts the day before
+        XCTAssertNil(try? HubWire.encode(p))
+        p.sleepWindow = HubSleepWindow(from: dayStart, to: dayStart)                         // from == to
+        p.sleep = []
+        XCTAssertNil(try? HubWire.encode(p))
+        p.sleepWindow = HubSleepWindow(from: dayStart, to: dayStart + 691_201)               // > 8 days
+        XCTAssertNil(try? HubWire.encode(p))
+        p.sleepWindow = HubSleepWindow(from: dayStart, to: dayStart + 86_400)
+        XCTAssertNotNil(try? HubWire.encode(p))
+    }
+
+    func testNoWindowsUnlessNOOPsSleepListIsLoaded() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.sleep = [night(dayStart - 5 * 3600)]
+        src.sleepLoaded = false
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        _ = run(engine(src, tr), at: dayStart + 36_000)
+        XCTAssertTrue(tr.bodies.allSatisfy { $0["sleep_window"] == nil })
+        XCTAssertTrue(tr.bodies.allSatisfy { ($0["sleep"] as! [Any]).isEmpty })
+        // Loaded but empty (a cold background launch): also nothing.
+        let src2 = FakeHubSource(), tr2 = FakeTransport()
+        src2.hr = hrSeries(dayStart, dayStart + 600)
+        _ = run(engine(src2, tr2), at: dayStart + 36_000)
+        XCTAssertTrue(tr2.bodies.allSatisfy { $0["sleep_window"] == nil })
+    }
+
+    func testWindowsOnlyForTheLast14DaysAndNotBeforeTheOldestLoadedSession() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let now = dayStart + 10 * 3600
+        src.sleep = [night(dayStart - 30 * 86_400), night(dayStart - 5 * 86_400 - 5 * 3600)]
+        _ = run(engine(src, tr), at: now)
+        let froms = windows(tr.bodies).map(\.from)
+        XCTAssertFalse(froms.isEmpty)
+        XCTAssertTrue(froms.allSatisfy { $0 >= HubBatchBuilder.startOfLocalDay(now - 13 * 86_400, tz) })
+        XCTAssertEqual(froms.count, 14)
+        XCTAssertTrue(tr.bodies.allSatisfy { windows([$0]).count <= 1 })      // one window per request
+        let src2 = FakeHubSource(), tr2 = FakeTransport()
+        src2.sleep = [night(dayStart - 2 * 86_400 - 5 * 3600)]                  // oldest loaded: 3 days back
+        _ = run(engine(src2, tr2), at: now)
+        XCTAssertEqual(windows(tr2.bodies).map(\.from).min(), HubBatchBuilder.startOfLocalDay(dayStart - 2 * 86_400 - 5 * 3600, tz))
+    }
+
+    func testDSTDayWindowsAre23And25Hours() {
+        let spring = dayStart + 54 * 86_400           // 2030-03-10 00:00 PST (spring forward)
+        let fall = dayStart + 292 * 86_400 - 3600     // 2030-11-03 00:00 PDT (fall back)
+        let w1 = HubBatchBuilder.sleepWindow(containing: spring + 3600, tz)
+        let w2 = HubBatchBuilder.sleepWindow(containing: fall + 3600, tz)
+        XCTAssertEqual(HubBatchBuilder.localDay(w1.from, tz), "2030-03-10")
+        XCTAssertEqual(w1.to - w1.from, 23 * 3600)
+        XCTAssertEqual(HubBatchBuilder.localDay(w2.from, tz), "2030-11-03")
+        XCTAssertEqual(w2.to - w2.from, 25 * 3600)
+    }
+
+    // MARK: fix round 2 — hold policy (re-review Q1) and Minors
+
+    func testHoldPolicy() {
+        let now = 100_000
+        func d(_ t: HubTrigger, bf: Bool = false, pend: Bool = false, ended: Int? = nil, since: Int? = nil) -> HubHoldDecision {
+            HubHoldPolicy.decide(trigger: t, now: now, backfilling: bf, historyPendingSync: pend,
+                                 lastBackfillingEndedAt: ended, holdingSince: since)
+        }
+        XCTAssertEqual(d(.foreground), HubHoldDecision(hold: false, holdingSince: nil, capped: false))
+        XCTAssertEqual(d(.foreground, bf: true), HubHoldDecision(hold: true, holdingSince: now, capped: false))
+        XCTAssertEqual(d(.backfill, pend: true), HubHoldDecision(hold: true, holdingSince: now, capped: false))
+        // 120 s quiet window after an offload ends: foreground and manual wait, the backfill trigger doesn't.
+        XCTAssertTrue(d(.foreground, ended: now - 119).hold)
+        XCTAssertTrue(d(.manual, ended: now - 60).hold)
+        XCTAssertFalse(d(.backfill, ended: now - 60).hold)
+        XCTAssertFalse(d(.foreground, ended: now - 121).hold)
+        // A continuous hold is capped at 2 h: then it sends anyway, keeping the start so Settings can show it.
+        XCTAssertEqual(d(.foreground, bf: true, since: now - 7_199), HubHoldDecision(hold: true, holdingSince: now - 7_199, capped: false))
+        XCTAssertEqual(d(.foreground, bf: true, since: now - 7_200), HubHoldDecision(hold: false, holdingSince: now - 7_200, capped: true))
+    }
+
+    func testHoldStatusIsVisibleAndCleared() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        src.historyPendingSync = true
+        _ = run(e, at: dayStart + 1000)
+        XCTAssertEqual(state.holdingSince, Date(timeIntervalSince1970: TimeInterval(dayStart + 1000)))
+        XCTAssertEqual(minutes(tr.bodies), [])
+        // Still pending 2 h later (a latched flag): the cap sends anyway and the status stays visible.
+        tr.bodies.removeAll()
+        _ = run(e, at: dayStart + 1000 + 7_200)
+        XCTAssertFalse(minutes(tr.bodies).isEmpty)
+        XCTAssertNotNil(state.holdingSince)
+        src.historyPendingSync = false
+        _ = run(e, .manual, at: dayStart + 1000 + 7_300)
+        XCTAssertNil(state.holdingSince)
+    }
+
+    /// Re-review Minor a: a deep offload drains in ~60 s passes, each firing the backfill hook. While held,
+    /// those runs keep the 10-minute floor instead of posting ~24 near-empty requests.
+    func testHeldBackfillRunsKeepTheTenMinuteFloor() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        _ = run(e, at: dayStart + 700)
+        src.backfilling = true
+        tr.requests.removeAll()
+        for pass in 1...24 {
+            let t = dayStart + 700 + 60 * pass
+            _ = run(e, .backfill, at: t, dataLandedAt: t - 2)
+        }
+        XCTAssertLessThanOrEqual(tr.requests.count, 3)       // 24 passes over 24 min → at most one per 10 min
+        src.backfilling = false
+        let t = dayStart + 700 + 60 * 25
+        if case .uploaded = run(e, .backfill, at: t, dataLandedAt: t - 2) {} else { XCTFail("final backfill must send") }
+    }
+
+    /// Re-review Minor b: a cancellation thrown by a store read (background expiry) is not an upload failure.
+    func testCancellationDuringAStoreReadIsNotAFailure() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        src.readError = CancellationError()
+        XCTAssertEqual(run(engine(src, tr), at: dayStart + 700), .cancelled)
+        XCTAssertNil(state.lastUploadOK)
+        XCTAssertNil(state.failingSince)
+        XCTAssertTrue(marks.load().catchUpPending)
+    }
+
+    /// Re-review Minor c: the real transport passes the redirect blocker to URLSession.
+    func testTransportPassesTheRedirectBlocker() {
+        var seen: URLSessionTaskDelegate?
+        let t = URLSessionHubTransport(perform: { req, delegate in
+            seen = delegate
+            return (Data("{}".utf8), HTTPURLResponse(url: req.url!, statusCode: 302, httpVersion: nil, headerFields: nil)!)
+        })
+        let r = blocking { try? await t.post(URLRequest(url: URL(string: "https://hub.example.test/ingest/phone")!)) }
+        XCTAssertTrue(seen is HubRedirectBlocker)
+        XCTAssertEqual(r?.status, 302)
     }
 }

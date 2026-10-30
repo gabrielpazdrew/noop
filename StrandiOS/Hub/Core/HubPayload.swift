@@ -75,8 +75,17 @@ struct HubStepRow: Equatable {
     var flights: Int?
 }
 
+/// R23: `[from, to)` epoch seconds. Present = `sleep[]` holds ALL sessions NOOP has starting in the
+/// window; the server supersedes stored sessions in it that are missing. The phone uses one local day.
+struct HubSleepWindow: Equatable {
+    var from: Int
+    var to: Int
+    static let maxSpan = 8 * 86_400
+}
+
 struct HubPayload: Equatable {
     var device: HubDevice
+    var sleepWindow: HubSleepWindow? = nil
     var daily: [HubDailyRow] = []
     var sleep: [HubSleepRow] = []
     var hrMinute: [HubHRMinute] = []
@@ -93,12 +102,26 @@ enum HubTable: String, CaseIterable, Codable {
 // MARK: - Encoding
 
 /// Encodes to JSON with explicit nulls and sorted keys (deterministic bytes, so row hashes are stable).
+enum HubWireError: Error { case badSleepWindow }
+
 enum HubWire {
+    /// Throws (never sends) when a sleep window breaks R23: `from < to`, span ≤ 8 days, every `sleep[]`
+    /// row's `start_ts` in `[from, to)`. The server would 422 it; the phone refuses it first.
     static func encode(_ p: HubPayload) throws -> Data {
-        try JSONSerialization.data(withJSONObject: object(p), options: [.sortedKeys])
+        if let w = p.sleepWindow {
+            guard w.from < w.to, w.to - w.from <= HubSleepWindow.maxSpan,
+                  p.sleep.allSatisfy({ $0.startTs >= w.from && $0.startTs < w.to }) else { throw HubWireError.badSleepWindow }
+        }
+        return try JSONSerialization.data(withJSONObject: object(p), options: [.sortedKeys])
     }
 
     static func object(_ p: HubPayload) -> [String: Any] {
+        var o = base(p)
+        if let w = p.sleepWindow { o["sleep_window"] = ["from": w.from, "to": w.to] }   // absent when not set
+        return o
+    }
+
+    private static func base(_ p: HubPayload) -> [String: Any] {
         [
             "schema": 1,
             "device": device(p.device),
@@ -144,10 +167,19 @@ enum HubWire {
         ["day": r.day, "steps": v(r.steps), "distance_m": v(r.distanceM), "flights": v(r.flights)]
     }
 
+    /// R23: one hash for a whole window's rows (order-free). An empty window has its own hash, so a vanished
+    /// session changes it.
+    static func windowHash(_ rows: [HubSleepRow]) -> String {
+        fnv(Data(rows.map { rowHash(sleep($0)) }.sorted().joined(separator: ",").utf8) + Data("|w".utf8))
+    }
+
     /// Stable 64-bit FNV-1a of a row's canonical JSON. Swift's `Hasher` is seeded per launch, so it
     /// can't remember "this row was already acked" across launches; this can.
     static func rowHash(_ row: [String: Any]) -> String {
-        let data = (try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])) ?? Data()
+        fnv((try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])) ?? Data())
+    }
+
+    private static func fnv(_ data: Data) -> String {
         var h: UInt64 = 0xcbf29ce484222325
         for b in data { h ^= UInt64(b); h = h &* 0x100000001b3 }
         return String(h, radix: 16)

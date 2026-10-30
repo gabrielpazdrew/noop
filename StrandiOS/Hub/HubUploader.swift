@@ -3,6 +3,7 @@
 // hook points (a completed strap backfill in AppModel, and scenePhase == .active in StrandiOSApp).
 // All decisions (what to send, when, what the ack moves) are in Core/ and unit-tested there.
 #if os(iOS)
+import Combine
 import Foundation
 import UIKit
 import WhoopStore
@@ -19,6 +20,7 @@ enum HubUploader {
     /// renewal reminder must not depend on opening the Health Hub screen), and uploads if due.
     static func sceneBecameActive() {
         HubHooks.uploadNow = { _ = await HubUploader.run(.manual) }
+        watchBackfilling()
         HubNotifications.refresh()
         start(.foreground)
     }
@@ -27,7 +29,22 @@ enum HubUploader {
     /// delivered it is the only background driver under SideStore.
     static func backfillFinished() { start(.backfill) }
 
-    static func start(_ trigger: HubTrigger) { Task { @MainActor in _ = await run(trigger) } }
+    static func start(_ trigger: HubTrigger) {
+        watchBackfilling()
+        Task { @MainActor in _ = await run(trigger) }
+    }
+
+    /// When `live.backfilling` last turned off (in memory): HubHoldPolicy's 120 s quiet window covers the gap
+    /// between two passes of a segmented offload. Installed on the first hook call, foreground or background.
+    private(set) static var lastBackfillingEndedAt: Int?
+    private static var backfillingWatch: AnyCancellable?
+
+    static func watchBackfilling() {
+        guard backfillingWatch == nil, let live = AppModel.shared?.live else { return }
+        backfillingWatch = live.$backfilling.removeDuplicates().dropFirst().sink { on in
+            if !on { HubUploader.lastBackfillingEndedAt = Int(Date().timeIntervalSince1970) }
+        }
+    }
 
     /// One run inside a background-task window. The expiration handler cancels the run: the in-flight
     /// request is cancelled, its rows stay unacked, and nothing advances.
@@ -121,7 +138,11 @@ final class HubRepositorySource: HubDataSource {
         let sleep = await sleepInputs(model.repo.sleeps, tz: tz)
         return HubRunContext(device: device, timeZone: tz, daily: daily, sleep: sleep,
                              steps: HubBatchBuilder.steps(steps),
-                             holdStreams: model.live.backfilling)
+                             // R23 completeness: only a loaded, non-empty list may define a window.
+                             sleepLoaded: model.repo.loaded && !model.repo.sleeps.isEmpty,
+                             backfilling: model.live.backfilling,
+                             historyPendingSync: model.live.historyPendingSync,
+                             lastBackfillingEndedAt: HubUploader.lastBackfillingEndedAt)
     }
 
     /// Sleep sessions with NOOP's own asleep minutes (decoded from the stored stages ON THE PHONE; only the

@@ -22,6 +22,7 @@ final class HubState {
         static let locked = "hub.locked"
         static let tripwire = "hub.tripwire"
         static let openAlerts = "hub.openAlerts"
+        static let holdingSince = "hub.holdingSince"
         static let renewalArmedFor = "hub.notice.renewalArmedFor"
         static let failureArmedFor = "hub.notice.failureArmedFor"
         static let lockedAlerted = "hub.notice.lockedAlerted"
@@ -75,6 +76,13 @@ final class HubState {
     var openAlerts: Int {
         get { defaults.integer(forKey: Key.openAlerts) }
         set { defaults.set(newValue, forKey: Key.openAlerts); changed() }
+    }
+
+    /// Start of the current hold of the band streams while the strap syncs (HubHoldPolicy); nil = not
+    /// holding. Kept past the 2-hour cap, so Settings shows a hold that never clears.
+    var holdingSince: Date? {
+        get { date(Key.holdingSince) }
+        set { setDate(newValue, Key.holdingSince); changed() }
     }
 
     func recordUploadSuccess(at time: Date) {

@@ -186,6 +186,12 @@ enum HubBatchBuilder {
     static func segmentStart(_ ts: Int, _ tz: TimeZone) -> Int { Swift.max(floorHour(ts), startOfLocalDay(ts, tz)) }
     static func segmentEnd(_ start: Int, _ tz: TimeZone) -> Int { Swift.min(floorHour(start) + 3_599, endOfLocalDay(start, tz)) }
 
+    /// R23: the sleep window of the local day containing `ts`: `[local midnight, next local midnight)`.
+    /// 23 or 25 hours on DST days.
+    static func sleepWindow(containing ts: Int, _ tz: TimeZone) -> HubSleepWindow {
+        HubSleepWindow(from: startOfLocalDay(ts, tz), to: endOfLocalDay(ts, tz) + 1)
+    }
+
     /// Last second of the local day containing `ts` (DST-correct: days can be 23 or 25 hours).
     static func endOfLocalDay(_ ts: Int, _ tz: TimeZone) -> Int {
         let cal = calendar(tz)

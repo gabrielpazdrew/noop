@@ -12,10 +12,14 @@ struct HubRunContext {
     var daily: [HubDailyInput]
     var sleep: [HubSleepInput]
     var steps: [HubStepRow]
-    /// True while the strap's history offload is running (`LiveState.backfilling`). NOOP writes live rows
-    /// at "now" during an offload, so the band streams (HR, events, battery) are held: sending them would
-    /// move their watermarks past history that hasn't landed yet. Daily, sleep, steps and status still go.
-    var holdStreams: Bool = false
+    /// R23 completeness guard: true only when NOOP's sleep list is loaded and non-empty, so a window
+    /// (which supersedes everything the hub holds in it) is never built from a partial list.
+    var sleepLoaded: Bool = false
+    /// NOOP's sync signals (`LiveState.backfilling`, `.historyPendingSync`) and when `backfilling` last
+    /// turned off; HubHoldPolicy turns them into a hold of the band streams.
+    var backfilling: Bool = false
+    var historyPendingSync: Bool = false
+    var lastBackfillingEndedAt: Int? = nil
 }
 
 protocol HubDataSource: AnyObject {
@@ -57,6 +61,7 @@ actor HubUploadEngine {
     static let hourLookback = 48 * 3_600         // late-backfill check window
     static let maxRequestsPerRun = 48
     static let maxKeyedRowsPerRequest = 60
+    static let sleepWindowDays = 14              // R23 windows: the band's buffer
 
     let source: HubDataSource
     let client: HubClient
@@ -101,13 +106,30 @@ actor HubUploadEngine {
         guard Self.shouldRun(trigger: trigger, now: nowTs, lastAttemptAt: w.lastAttemptAt,
                              catchUpPending: w.catchUpPending, dataLandedAt: dataLandedAt) else { return .skipped("throttled") }
         guard let ctx = await source.context(now: nowTs) else { return .skipped("store not ready") }
+        let hold = HubHoldPolicy.decide(trigger: trigger, now: nowTs, backfilling: ctx.backfilling,
+                                        historyPendingSync: ctx.historyPendingSync,
+                                        lastBackfillingEndedAt: ctx.lastBackfillingEndedAt,
+                                        holdingSince: state.holdingSince.map { Int($0.timeIntervalSince1970) })
+        let since = hold.holdingSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        if state.holdingSince != since { state.holdingSince = since }
+        // A held run sends no band data, so it gets no exemption from the 10-minute floor: a deep offload
+        // fires the backfill hook once per ~60 s pass and must not turn into ~24 near-empty uploads.
+        if hold.hold && !Self.shouldRun(trigger: trigger, now: nowTs, lastAttemptAt: w.lastAttemptAt,
+                                        catchUpPending: w.catchUpPending) {
+            return .skipped("held: strap sync running")
+        }
         w.lastAttemptAt = nowTs
         marks.save(w)
 
         do {
-            return try await send(trigger: trigger, ctx: ctx, base: base, nowTs: nowTs, now: now,
+            return try await send(trigger: trigger, ctx: ctx, hold: hold.hold, base: base, nowTs: nowTs, now: now,
                                   shouldContinue: shouldContinue, w: &w)
         } catch {
+            if error is CancellationError || Task.isCancelled {
+                // Background time ran out during a store read: not a hub failure (re-review Minor b).
+                w.catchUpPending = true; marks.save(w)
+                return .cancelled
+            }
             // A store read failed: nothing in this request was sent, nothing advances. Counted as a failed
             // upload so a persistent read problem reaches the 6-hour notice like any other failure.
             state.recordUploadFailure(at: now(), reason: HubFailure.storeRead.reason)
@@ -117,16 +139,28 @@ actor HubUploadEngine {
         }
     }
 
-    private func send(trigger: HubTrigger, ctx: HubRunContext, base: URL, nowTs: Int, now: @escaping () -> Date,
+    private func send(trigger: HubTrigger, ctx: HubRunContext, hold: Bool, base: URL, nowTs: Int, now: @escaping () -> Date,
                       shouldContinue: @escaping () -> Bool, w: inout HubWatermarks) async throws -> HubRunOutcome {
         let tz = ctx.timeZone
-        let streams: [HubStream] = ctx.holdStreams ? [] : HubStream.allCases
+        let streams: [HubStream] = hold ? [] : HubStream.allCases
         // Keyed tables: rows whose hash differs from the acked one.
         var pendingDaily = ctx.daily.map(HubBatchBuilder.daily).filter {
             w.rowHash(.daily, $0.day) != HubWire.rowHash(HubWire.daily($0))
         }
-        var pendingSleep = HubBatchBuilder.sleep(ctx.sleep, timeZone: tz).filter {
-            w.rowHash(.sleep, String($0.startTs)) != HubWire.rowHash(HubWire.sleep($0))
+        // R23 sleep windows: one per local day over the last 14 days (never older than the oldest loaded
+        // session), sent whole whenever its content hash differs from the acked one, including emptied.
+        var pendingWindows: [(window: HubSleepWindow, rows: [HubSleepRow], hash: String)] = []
+        if ctx.sleepLoaded, let oldest = ctx.sleep.map(\.startTs).min() {
+            let rows = HubBatchBuilder.sleep(ctx.sleep, timeZone: tz)
+            let floor = HubBatchBuilder.startOfLocalDay(oldest, tz)
+            var win = HubBatchBuilder.sleepWindow(containing: nowTs, tz)
+            for _ in 0..<Self.sleepWindowDays where win.from >= floor {
+                let inWin = rows.filter { $0.startTs >= win.from && $0.startTs < win.to }
+                let hash = HubWire.windowHash(inWin)
+                if w.windows[String(win.from)] != hash { pendingWindows.append((win, inWin, hash)) }
+                win = HubBatchBuilder.sleepWindow(containing: win.from - 1, tz)
+            }
+            pendingWindows.reverse()   // oldest first
         }
         // Streams: acked segments whose fingerprint changed since (late backfill). Late rows only arrive
         // through a strap offload, so the scan runs for a backfill (and "Upload now"), not every foreground.
@@ -200,7 +234,7 @@ actor HubUploadEngine {
             }
             // Always send at least one request per run (it carries device status and steps, and brings
             // back the lock flag and renewal estimate); after that, only while there is something to send.
-            if chunk.isEmpty && sent > 0 && pendingDaily.isEmpty && pendingSleep.isEmpty { break }
+            if chunk.isEmpty && sent > 0 && pendingDaily.isEmpty && pendingWindows.isEmpty { break }
 
             // Fingerprint BEFORE reading rows: a row landing in between makes the stored mark stale, which
             // only ever causes a harmless resend later, never a skipped row. Marks are per segment.
@@ -229,7 +263,9 @@ actor HubUploadEngine {
                 payload.battery += HubBatchBuilder.battery(try await source.battery(from: r.lowerBound, to: r.upperBound))
             }
             payload.daily = Array(pendingDaily.prefix(Self.maxKeyedRowsPerRequest))
-            payload.sleep = Array(pendingSleep.prefix(Self.maxKeyedRowsPerRequest))
+            let window = pendingWindows.first
+            payload.sleepWindow = window?.window
+            payload.sleep = window?.rows ?? []
             if sent == 0 { payload.steps = ctx.steps }
 
             let result: HubSendResult
@@ -258,7 +294,11 @@ actor HubUploadEngine {
                     return .failed(.badResponse)
                 }
                 pendingDaily.removeFirst(payload.daily.count)
-                pendingSleep.removeFirst(payload.sleep.count)
+                if let win = window {
+                    // Confirmed by this 2xx + parseable ack (one batch server-side), even with zero rows.
+                    w.windows[String(win.window.from)] = win.hash
+                    pendingWindows.removeFirst()
+                }
                 if !chunk.isResend {
                     for (s, rs) in chunk.ranges { if let last = rs.last { cursor[s] = last.upperBound + 1 } }
                 }
@@ -272,8 +312,9 @@ actor HubUploadEngine {
         w.catchUpPending = more
         var keep: [HubTable: Set<String>] = [:]
         if !ctx.daily.isEmpty { keep[.daily] = Set(ctx.daily.map(\.day)) }
-        if !ctx.sleep.isEmpty { keep[.sleep] = Set(ctx.sleep.map { String($0.startTs) }) }
-        w.prune(hoursBefore: HubBatchBuilder.floorHour(nowTs - Self.hourLookback - 3_600), keepRowKeys: keep)
+        w.rows[HubTable.sleep.rawValue] = nil   // per-row sleep hashes are superseded by R23 windows
+        w.prune(hoursBefore: HubBatchBuilder.floorHour(nowTs - Self.hourLookback - 3_600), keepRowKeys: keep,
+                windowsBefore: HubBatchBuilder.startOfLocalDay(nowTs - (Self.sleepWindowDays + 1) * 86_400, tz))
         marks.save(w)
         afterAttempt()
         return .uploaded(requests: sent, more: more)
@@ -307,9 +348,6 @@ actor HubUploadEngine {
             for (h, mark) in hourMarks[s] ?? [] { w.setHourMark(s, h, mark) }
         }
         for row in payload.daily { w.rows[HubTable.daily.rawValue, default: [:]][row.day] = HubWire.rowHash(HubWire.daily(row)) }
-        for row in payload.sleep {
-            w.rows[HubTable.sleep.rawValue, default: [:]][String(row.startTs)] = HubWire.rowHash(HubWire.sleep(row))
-        }
         return true
     }
 
