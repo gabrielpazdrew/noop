@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Record exact source commit
         run: git log --oneline -1
@@ -51,7 +53,7 @@ jobs:
       - name: Hub unit tests (iOS simulator)
         run: |
           set -euo pipefail
-          DESTS=$(xcodebuild -scheme NOOPiOSHubTests -showdestinations 2>/dev/null || true)
+          DESTS=$(xcodebuild -scheme NOOPiOSHubTests -showdestinations 2>&1 || true)
           # Only the "Available destinations" block: stop at "Ineligible destinations", drop error lines.
           LINE=$(printf '%s\n' "$DESTS" | sed '/Ineligible destinations/q' | grep -v 'error:' \
             | grep 'platform:iOS Simulator' | grep 'name:iPhone' \
