@@ -27,10 +27,31 @@ final class UserNotificationHubCenter: HubNoticeCenter {
 }
 
 enum HubNotifications {
-    /// Re-plan every hub notification from the current state. Call after each upload attempt
-    /// (T4.1), when the app comes to the foreground, and when Settings change. Cheap and idempotent.
-    static func refresh(state: HubState = .shared, now: Date = Date(),
-                        center: HubNoticeCenter = UserNotificationHubCenter()) {
+    /// Re-plan every hub notification from the current state. Called after each upload attempt
+    /// (HubUploader), when the app comes to the foreground (HubUploader.sceneBecameActive), when
+    /// Settings change, and once the notification prompt is answered. Cheap and idempotent; callable
+    /// from any thread.
+    ///
+    /// Plan + apply + save run on the main actor, one refresh at a time, so two callers can never both
+    /// read un-armed memory and post a due-now banner twice (T4.3 review finding 2). When the app may
+    /// not show notifications, nothing is applied and the memory is left as it was (finding 1).
+    static func refresh(state: HubState = .shared, now: Date? = nil,
+                        center: HubNoticeCenter? = nil) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let canNotify: Bool
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral: canNotify = true
+            default: canNotify = false
+            }
+            Task { @MainActor in
+                apply(state: state, now: now ?? Date(), canNotify: canNotify,
+                      center: center ?? UserNotificationHubCenter())
+            }
+        }
+    }
+
+    @MainActor
+    private static func apply(state: HubState, now: Date, canNotify: Bool, center: HubNoticeCenter) {
         let inputs = HubNoticeInputs(now: now,
                                      enabled: state.enabled,
                                      serverRenewalEstimate: state.serverRenewalEstimate,
@@ -38,14 +59,16 @@ enum HubNotifications {
                                      failingSince: state.failingSince,
                                      locked: state.locked,
                                      tripwire: state.tripwire)
-        let (actions, memory) = HubNoticePlanner.plan(inputs, memory: state.noticeMemory)
-        HubNoticeApplier.apply(actions, now: now, to: center)
-        state.noticeMemory = memory
+        state.noticeMemory = HubNoticeRefresher.refresh(inputs, memory: state.noticeMemory,
+                                                        canNotify: canNotify, center: center)
     }
 
     /// Ask for alert permission (once; iOS remembers the answer). Called when the hub is turned on.
+    /// Re-plans once the user has answered, so a notice held back while the prompt was open goes out.
     static func requestAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            refresh()
+        }
     }
 }
 #endif

@@ -176,3 +176,17 @@ enum HubNoticeApplier {
         }
     }
 }
+
+enum HubNoticeRefresher {
+    /// One refresh: plan, apply, and return the memory to store. When the app may not show
+    /// notifications (`canNotify` false: denied, or the prompt not answered yet) nothing is applied and
+    /// the memory comes back UNCHANGED, so nothing is recorded as "sent" while it couldn't be seen; the
+    /// refresh after permission is granted delivers it (T4.3 review finding 1).
+    static func refresh(_ inputs: HubNoticeInputs, memory: HubNoticeMemory, canNotify: Bool,
+                        center: HubNoticeCenter) -> HubNoticeMemory {
+        guard canNotify else { return memory }
+        let (actions, next) = HubNoticePlanner.plan(inputs, memory: memory)
+        HubNoticeApplier.apply(actions, now: inputs.now, to: center)
+        return next
+    }
+}

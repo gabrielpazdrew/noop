@@ -109,4 +109,23 @@ final class HubStateTests: XCTestCase {
         XCTAssertEqual(attrs[kSecAttrService as String] as? String, HubKeychain.service)
         XCTAssertEqual(attrs[kSecAttrSynchronizable as String] as? Bool, false)
     }
+
+    // T4.3 review finding 3: a write from a background thread is announced on the main thread.
+    func testChangeNoticeIsPostedOnTheMainThread() {
+        let suite = "hub.test.mainthread.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let state = HubState(defaults: defaults)
+        var onMain: [Bool] = []
+        let token = NotificationCenter.default.addObserver(forName: HubState.didChange, object: state, queue: nil) { _ in
+            onMain.append(Thread.isMainThread)
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { state.recordUploadFailure(at: Date(), reason: "HTTP 503"); done.signal() }
+        done.wait()
+        let deadline = Date().addingTimeInterval(2)
+        while onMain.isEmpty && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        XCTAssertEqual(onMain, [true])
+    }
 }

@@ -172,8 +172,32 @@ final class HubNoticePlannerTests: XCTestCase {
     func testTripwireFiresOnce() {
         var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
         step(inputs(now: t0, tripwire: true), &memory, center)
-        step(inputs(now: t0.addingTimeInterval(60), tripwire: true), &memory, center)
         XCTAssertEqual(center.count(.tripwire), 1)
+        center.pending.removeAll()   // delivered; a re-fire would show up as a new one
+        let again = step(inputs(now: t0.addingTimeInterval(60), tripwire: true), &memory, center)
+        XCTAssertEqual(center.count(.tripwire), 0)
+        XCTAssertEqual(again, [])
+        step(inputs(now: t0.addingTimeInterval(120), tripwire: false), &memory, center)
+        step(inputs(now: t0.addingTimeInterval(180), tripwire: true), &memory, center)
+        XCTAssertEqual(center.count(.tripwire), 1)
+    }
+
+    // MARK: permission (T4.3 review finding 1)
+
+    func testNothingIsArmedWhileNotificationsCannotShow() {
+        let center = FakeNoticeCenter(now: t0)
+        let i = inputs(now: t0, server: t0.addingTimeInterval(day), failingSince: t0.addingTimeInterval(-7 * hour),
+                       locked: true, tripwire: true)
+        let held = HubNoticeRefresher.refresh(i, memory: HubNoticeMemory(), canNotify: false, center: center)
+        XCTAssertEqual(held, HubNoticeMemory())
+        XCTAssertEqual(center.pending.count, 0)
+        // Permission granted: the same state now delivers every due notice.
+        let sent = HubNoticeRefresher.refresh(i, memory: held, canNotify: true, center: center)
+        XCTAssertEqual(center.count(.renewal), 1)
+        XCTAssertEqual(center.count(.uploadsFailing), 1)
+        XCTAssertEqual(center.count(.hubLocked), 1)
+        XCTAssertEqual(center.count(.tripwire), 1)
+        XCTAssertTrue(sent.lockedAlerted && sent.tripwireAlerted)
     }
 
     func testIdentifiersAreStableAndDistinct() {

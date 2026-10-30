@@ -133,7 +133,15 @@ final class HubState {
         if let s, !s.isEmpty { defaults.set(s, forKey: key) } else { defaults.removeObject(forKey: key) }
         changed()
     }
-    private func changed() { NotificationCenter.default.post(name: Self.didChange, object: self) }
+    /// Always posted on the main thread, so observers (the Settings screen's SwiftUI state) never update
+    /// off-main when the uploader writes from a background task (T4.3 review finding 3).
+    private func changed() {
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: Self.didChange, object: self)
+        } else {
+            DispatchQueue.main.async { NotificationCenter.default.post(name: Self.didChange, object: self) }
+        }
+    }
 }
 
 /// Hooks the Settings screen calls and the uploader (T4.1) installs at app start.

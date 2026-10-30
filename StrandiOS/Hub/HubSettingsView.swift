@@ -25,7 +25,7 @@ struct HubSettingsView: View {
             renewalCard
         }
         .onAppear(perform: load)
-        .onReceive(NotificationCenter.default.publisher(for: HubState.didChange)) { _ in tick += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: HubState.didChange).receive(on: RunLoop.main)) { _ in tick += 1 }
     }
 
     // MARK: cards
