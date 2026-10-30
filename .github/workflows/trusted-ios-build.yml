@@ -52,7 +52,9 @@ jobs:
         run: |
           set -euo pipefail
           DESTS=$(xcodebuild -scheme NOOPiOSHubTests -showdestinations 2>/dev/null || true)
-          LINE=$(printf '%s\n' "$DESTS" | grep 'platform:iOS Simulator' | grep 'name:iPhone' \
+          # Only the "Available destinations" block: stop at "Ineligible destinations", drop error lines.
+          LINE=$(printf '%s\n' "$DESTS" | sed '/Ineligible destinations/q' | grep -v 'error:' \
+            | grep 'platform:iOS Simulator' | grep 'name:iPhone' \
             | grep -v -i placeholder | grep -E 'id:[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' | sed -n 1p || true)
           UDID=$(printf '%s\n' "$LINE" | grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' | sed -n 1p || true)
           test -n "$UDID" || { echo "::error::no available iPhone simulator"; printf '%s\n' "$DESTS"; exit 1; }
