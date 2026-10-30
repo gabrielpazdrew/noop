@@ -821,8 +821,8 @@ final class HubUploaderTests: XCTestCase {
         _ = run(engine(src, tr), at: now)
         let froms = windows(tr.bodies).map(\.from)
         XCTAssertFalse(froms.isEmpty)
-        XCTAssertTrue(froms.allSatisfy { $0 >= HubBatchBuilder.startOfLocalDay(now - 13 * 86_400, tz) })
-        XCTAssertEqual(froms.count, 14)
+        XCTAssertTrue(froms.allSatisfy { $0 >= now - 13 * 86_400 })        // R26 addendum
+        XCTAssertEqual(froms.count, 13)                                   // 10 am: 13 days back is mid-day, so 13 windows
         XCTAssertTrue(tr.bodies.allSatisfy { windows([$0]).count <= 1 })      // one window per request
         let src2 = FakeHubSource(), tr2 = FakeTransport()
         src2.sleep = [night(dayStart - 2 * 86_400 - 5 * 3600)]                  // oldest loaded: 3 days back
@@ -920,5 +920,61 @@ final class HubUploaderTests: XCTestCase {
         let r = blocking { try? await t.post(URLRequest(url: URL(string: "https://hub.example.test/ingest/phone")!)) }
         XCTAssertTrue(seen is HubRedirectBlocker)
         XCTAssertEqual(r?.status, 302)
+    }
+
+    // MARK: fix round 3 — R26
+
+    /// R26 addendum: windows only for local days whose start is >= now − 13 days, exactly at the edge and
+    /// across the spring-forward change (2030-03-10, a 23-hour day).
+    func testWindowsStopAtThirteenDaysAcrossDST() {
+        let mar7 = dayStart + 51 * 86_400                 // 2030-03-07 00:00 PST
+        let edge = mar7 + 13 * 86_400                     // 2030-03-20 01:00 PDT: Mar 7 is exactly 13 days back
+        for (now, oldestDay, count) in [(edge, "2030-03-07", 14), (edge + 1, "2030-03-08", 13)] {
+            setUp()
+            let src = FakeHubSource(), tr = FakeTransport()
+            src.sleep = [night(mar7 - 10 * 86_400), night(edge - 6 * 3600)]
+            _ = run(engine(src, tr), at: now)
+            let froms = windows(tr.bodies).map(\.from)
+            XCTAssertEqual(froms.count, count)
+            XCTAssertTrue(froms.allSatisfy { $0 >= now - 13 * 86_400 }, "a window older than now − 13 days")
+            XCTAssertEqual(froms.min().map { HubBatchBuilder.localDay($0, tz) }, oldestDay)
+            tearDown()
+        }
+    }
+
+    /// R26: if the server 422s a request carrying a window, that window is dropped (recorded, not retried)
+    /// so it can never block HR or daily uploads.
+    func testRejectedWindowDoesNotWedgeTheQueue() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 18 * 3600
+        src.sleep = [night(dayStart - 5 * 3600)]
+        src.sleepLoaded = true
+        src.hr = hrSeries(dayStart + 17 * 3600, now)
+        let badFrom = HubBatchBuilder.startOfLocalDay(dayStart - 5 * 3600, tz)
+        tr.respond = { j in
+            if let w = j["sleep_window"] as? [String: Any], w["from"] as? Int == badFrom {
+                return (422, Data("{\"error\":\"invalid\"}".utf8))
+            }
+            return FakeTransport.ackAll(j)
+        }
+        let first = run(e, at: now)
+        XCTAssertEqual(first, .failed(.rejected))
+        XCTAssertEqual(state.lastUploadResult, "Sleep window rejected (HTTP 422); dropped")
+        XCTAssertNotNil(marks.load().rejectedWindows[String(badFrom)])
+        tr.bodies.removeAll()
+        let second = run(e, .manual, at: now + 60)
+        if case .uploaded = second {} else { XCTFail("queue wedged: \(second)") }
+        XCTAssertFalse(windows(tr.bodies).contains { $0.from == badFrom })
+        XCTAssertFalse(minutes(tr.bodies).isEmpty)                     // HR goes through
+        XCTAssertEqual(state.lastUploadOK, true)
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 120)
+        XCTAssertFalse(windows(tr.bodies).contains { $0.from == badFrom })   // not retried
+        // New content in that window is a new window: it gets one fresh try.
+        src.sleep.append(night(dayStart - 2 * 3600, hours: 1))
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 180)
+        XCTAssertTrue(windows(tr.bodies).contains { $0.from == badFrom })
     }
 }

@@ -62,6 +62,8 @@ actor HubUploadEngine {
     static let maxRequestsPerRun = 48
     static let maxKeyedRowsPerRequest = 60
     static let sleepWindowDays = 14              // R23 windows: the band's buffer
+    /// R26 addendum: a window's start must be >= now − 13 days (the server refuses < now − 14 days).
+    static let sleepWindowMaxAge = 13 * 86_400
 
     let source: HubDataSource
     let client: HubClient
@@ -154,10 +156,12 @@ actor HubUploadEngine {
             let rows = HubBatchBuilder.sleep(ctx.sleep, timeZone: tz)
             let floor = HubBatchBuilder.startOfLocalDay(oldest, tz)
             var win = HubBatchBuilder.sleepWindow(containing: nowTs, tz)
-            for _ in 0..<Self.sleepWindowDays where win.from >= floor {
+            let ageFloor = nowTs - Self.sleepWindowMaxAge
+            for _ in 0..<Self.sleepWindowDays where win.from >= floor && win.from >= ageFloor {
                 let inWin = rows.filter { $0.startTs >= win.from && $0.startTs < win.to }
                 let hash = HubWire.windowHash(inWin)
-                if w.windows[String(win.from)] != hash { pendingWindows.append((win, inWin, hash)) }
+                let key = String(win.from)
+                if w.windows[key] != hash && w.rejectedWindows[key] != hash { pendingWindows.append((win, inWin, hash)) }
                 win = HubBatchBuilder.sleepWindow(containing: win.from - 1, tz)
             }
             pendingWindows.reverse()   // oldest first
@@ -282,6 +286,16 @@ actor HubUploadEngine {
                 w.catchUpPending = true; marks.save(w)
                 return .cancelled
             case .failed(let f):
+                if f == .rejected, let win = window {
+                    // R26: the whole request was refused and it carried a window. Drop that window (with this
+                    // content) from future requests, so it can't block HR/daily on every retry. The next run
+                    // resends the rest without it.
+                    w.rejectedWindows[String(win.window.from)] = win.hash
+                    state.recordUploadFailure(at: now(), reason: "Sleep window rejected (HTTP 422); dropped")
+                    marks.save(w)
+                    afterAttempt()
+                    return .failed(f)
+                }
                 state.recordUploadFailure(at: now(), reason: f.reason)
                 marks.save(w)
                 afterAttempt()

@@ -36,13 +36,16 @@ struct HubWatermarks: Codable, Equatable {
     var rows: [String: [String: String]] = [:]
     /// R23: per sleep window (key = window `from`), the hash of the rows last confirmed by an ack.
     var windows: [String: String] = [:]
+    /// R26: windows the server refused (422), with the content hash refused. Never retried with that
+    /// content, so one bad window can't block HR or daily uploads; new content gets one fresh try.
+    var rejectedWindows: [String: String] = [:]
     /// The last run stopped with chunks still to send (catch-up), so the 10-minute floor doesn't apply.
     var catchUpPending = false
     var lastAttemptAt: Int?
 
     init() {}
 
-    private enum CodingKeys: String, CodingKey { case stream, hours, rows, windows, catchUpPending, lastAttemptAt }
+    private enum CodingKeys: String, CodingKey { case stream, hours, rows, windows, rejectedWindows, catchUpPending, lastAttemptAt }
 
     /// Tolerant: a field added in a later build decodes as empty instead of dropping every watermark.
     init(from decoder: Decoder) throws {
@@ -51,6 +54,7 @@ struct HubWatermarks: Codable, Equatable {
         hours = try c.decodeIfPresent([String: [String: HubHourMark]].self, forKey: .hours) ?? [:]
         rows = try c.decodeIfPresent([String: [String: String]].self, forKey: .rows) ?? [:]
         windows = try c.decodeIfPresent([String: String].self, forKey: .windows) ?? [:]
+        rejectedWindows = try c.decodeIfPresent([String: String].self, forKey: .rejectedWindows) ?? [:]
         catchUpPending = try c.decodeIfPresent(Bool.self, forKey: .catchUpPending) ?? false
         lastAttemptAt = try c.decodeIfPresent(Int.self, forKey: .lastAttemptAt)
     }
@@ -72,7 +76,10 @@ struct HubWatermarks: Codable, Equatable {
 
     /// Drop hour marks older than `before` and row hashes for keys that are no longer in the window.
     mutating func prune(hoursBefore before: Int, keepRowKeys: [HubTable: Set<String>], windowsBefore: Int? = nil) {
-        if let wb = windowsBefore { windows = windows.filter { (Int($0.key) ?? 0) >= wb } }
+        if let wb = windowsBefore {
+            windows = windows.filter { (Int($0.key) ?? 0) >= wb }
+            rejectedWindows = rejectedWindows.filter { (Int($0.key) ?? 0) >= wb }
+        }
         for (k, marks) in hours {
             hours[k] = marks.filter { (Int($0.key) ?? 0) >= before }
         }
