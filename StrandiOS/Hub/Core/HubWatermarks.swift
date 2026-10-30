@@ -76,11 +76,21 @@ struct HubWatermarks: Codable, Equatable {
 
     func rowHash(_ t: HubTable, _ key: String) -> String? { rows[t.rawValue]?[key] }
 
-    func isRejected(_ t: HubTable, _ key: String, _ hash: String) -> Bool { rejectedRows[t.rawValue]?[key] == hash }
+    /// A skipped row stays skipped while its content is unchanged, for 24 hours; then it gets one retry
+    /// (a phone clock that was more than a day off can make a valid row look bad). Stored as "hash|epoch".
+    static let rejectRetryAfter = 86_400
 
-    mutating func reject(_ t: HubTable, _ key: String, _ hash: String) {
+    func isRejected(now: Int, _ t: HubTable, _ key: String, _ hash: String) -> Bool {
+        guard let v = rejectedRows[t.rawValue]?[key] else { return false }
+        let parts = v.split(separator: "|", maxSplits: 1)
+        guard String(parts[0]) == hash else { return false }
+        let at = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        return now - at < Self.rejectRetryAfter
+    }
+
+    mutating func reject(at now: Int, _ t: HubTable, _ key: String, _ hash: String) {
         var m = rejectedRows[t.rawValue, default: [:]]
-        m[key] = hash
+        m[key] = "\(hash)|\(now)"
         if m.count > 2_000 { m.removeValue(forKey: m.keys.min()!) }     // bounded
         rejectedRows[t.rawValue] = m
     }

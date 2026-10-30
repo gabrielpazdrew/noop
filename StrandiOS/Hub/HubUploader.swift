@@ -37,12 +37,18 @@ enum HubUploader {
     /// When `live.backfilling` last turned off (in memory): HubHoldPolicy's 120 s quiet window covers the gap
     /// between two passes of a segmented offload. Installed on the first hook call, foreground or background.
     private(set) static var lastBackfillingEndedAt: Int?
+    /// When `live.historyPendingSync` last turned off (in memory): restarts HubHoldPolicy's pending clock.
+    private(set) static var lastPendingSyncEndedAt: Int?
     private static var backfillingWatch: AnyCancellable?
+    private static var pendingSyncWatch: AnyCancellable?
 
     static func watchBackfilling() {
         guard backfillingWatch == nil, let live = AppModel.shared?.live else { return }
         backfillingWatch = live.$backfilling.removeDuplicates().dropFirst().sink { on in
             if !on { HubUploader.lastBackfillingEndedAt = Int(Date().timeIntervalSince1970) }
+        }
+        pendingSyncWatch = live.$historyPendingSync.removeDuplicates().dropFirst().sink { on in
+            if !on { HubUploader.lastPendingSyncEndedAt = Int(Date().timeIntervalSince1970) }
         }
     }
 
@@ -142,7 +148,8 @@ final class HubRepositorySource: HubDataSource {
                              sleepLoaded: model.repo.loaded && !model.repo.sleeps.isEmpty,
                              backfilling: model.live.backfilling,
                              historyPendingSync: model.live.historyPendingSync,
-                             lastBackfillingEndedAt: HubUploader.lastBackfillingEndedAt)
+                             lastBackfillingEndedAt: HubUploader.lastBackfillingEndedAt,
+                             lastPendingSyncEndedAt: HubUploader.lastPendingSyncEndedAt)
     }
 
     /// Sleep sessions with NOOP's own asleep minutes (decoded from the stored stages ON THE PHONE; only the

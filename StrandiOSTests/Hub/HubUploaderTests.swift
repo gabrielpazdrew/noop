@@ -1181,4 +1181,59 @@ final class HubUploaderTests: XCTestCase {
         _ = run(e, .manual, at: now + 60)
         XCTAssertTrue(tr.bodies.allSatisfy { ($0["sleep"] as! [Any]).isEmpty })   // acked: not resent
     }
+
+    // MARK: fix round 5
+
+    /// (A) "pending sync" turning off is recorded like backfilling's end, so a second episode that no run
+    /// saw start fresh is not capped at once by the first episode's clock.
+    func testPendingSyncEndRestartsThePendingClock() {
+        let t = 100_000
+        let mem = HubHoldMemory(holdingSince: t, lastSeen: t, pendingSince: t)
+        let later = t + 3 * 3600
+        let fresh = HubHoldPolicy.decide(trigger: .foreground, now: later, backfilling: false, historyPendingSync: true,
+                                         lastBackfillingEndedAt: nil, lastPendingSyncEndedAt: t + 1800, memory: mem)
+        XCTAssertTrue(fresh.hold)
+        XCTAssertEqual(fresh.memory.pendingSince, later)
+        // Without a recorded end (a genuinely latched flag) the clock keeps running and the cap applies.
+        let latched = HubHoldPolicy.decide(trigger: .foreground, now: later, backfilling: false, historyPendingSync: true,
+                                           lastBackfillingEndedAt: nil, lastPendingSyncEndedAt: nil, memory: mem)
+        XCTAssertFalse(latched.hold)
+        XCTAssertTrue(latched.capped)
+        // An end recorded BEFORE the current episode began doesn't reset it.
+        let old = HubHoldPolicy.decide(trigger: .foreground, now: later, backfilling: false, historyPendingSync: true,
+                                       lastBackfillingEndedAt: nil, lastPendingSyncEndedAt: t - 60, memory: mem)
+        XCTAssertTrue(old.capped)
+    }
+
+    /// (B) A row skipped after a 422 gets one retry after 24 h even with unchanged content (a phone clock
+    /// that was more than a day off can make a valid row look bad).
+    func testSkippedRowIsRetriedAfter24Hours() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 12 * 3600
+        let badT = now - 3 * 3600, goodT = now - 900
+        src.bat = [HubBatteryInput(ts: badT, soc: 59, mv: 3890, charging: nil),
+                   HubBatteryInput(ts: goodT, soc: 58, mv: 3880, charging: nil)]   // the watermark moves past badT
+        var refuse = true
+        tr.respond = { j in
+            if refuse, let rows = j["battery"] as? [[String: Any]], let i = rows.firstIndex(where: { $0["t"] as? Int == badT }) {
+                return HubUploaderTests.invalid422("$.battery[\(i)].t")
+            }
+            return FakeTransport.ackAll(j)
+        }
+        _ = run(e, at: now)
+        XCTAssertEqual(marks.load().streamMark(.battery), goodT)
+        refuse = false
+        func sentBad() -> Bool { tr.bodies.contains { ($0["battery"] as! [[String: Any]]).contains { $0["t"] as? Int == badT } } }
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 23 * 3600)
+        XCTAssertFalse(sentBad())
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 24 * 3600 + 60)
+        XCTAssertTrue(sentBad())
+        XCTAssertEqual(marks.load().streamMark(.battery), goodT)
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 24 * 3600 + 120)
+        XCTAssertFalse(sentBad())                                  // acked now: not sent again
+    }
 }

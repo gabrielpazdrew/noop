@@ -11,8 +11,9 @@
 // uploads. So:
 // - a hold "continues" only while runs keep seeing it at most 10 minutes apart; a longer gap (an offload
 //   that ended by timeout or disconnect with no run to see it) starts a NEW hold, cap clock reset;
-// - the cap applies to pending-sync / quiet holds, measured from the first run that saw the pending flag
-//   with no run since seeing it false (gaps don't reset that clock, so sparse runs still reach the cap);
+// - the cap applies to pending-sync / quiet holds, measured from the first run that saw the pending flag,
+//   restarted when the flag was seen false since (by a run, or by the adapter's `historyPendingSync` sink);
+//   gaps alone don't reset it, so a latched flag on sparse runs still reaches the cap;
 // - a running offload (`backfilling`) is never capped: NOOP clears that flag on every exit and disconnect.
 import Foundation
 
@@ -38,9 +39,15 @@ enum HubHoldPolicy {
     static let continuityGap = 10 * 60
 
     static func decide(trigger: HubTrigger, now: Int, backfilling: Bool, historyPendingSync: Bool,
-                       lastBackfillingEndedAt: Int?, memory: HubHoldMemory) -> HubHoldDecision {
+                       lastBackfillingEndedAt: Int?, lastPendingSyncEndedAt: Int? = nil,
+                       memory: HubHoldMemory) -> HubHoldDecision {
         let quiet = trigger != .backfill && lastBackfillingEndedAt.map { now - $0 < quietWindow } == true
-        let pendingSince = historyPendingSync ? (memory.pendingSince ?? now) : nil
+        // The pending clock runs from the first sighting of this episode. When the flag was seen turning off
+        // (in memory, like backfilling's end) after that sighting, this is a new episode: restart the clock.
+        var pendingSince: Int? = nil
+        if historyPendingSync {
+            if let p = memory.pendingSince, lastPendingSyncEndedAt.map({ $0 < p }) ?? true { pendingSince = p } else { pendingSince = now }
+        }
         guard backfilling || historyPendingSync || quiet else {
             return HubHoldDecision(hold: false, memory: HubHoldMemory(), capped: false)
         }

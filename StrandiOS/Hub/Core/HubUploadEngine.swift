@@ -20,6 +20,8 @@ struct HubRunContext {
     var backfilling: Bool = false
     var historyPendingSync: Bool = false
     var lastBackfillingEndedAt: Int? = nil
+    /// When `historyPendingSync` last turned off (in memory, from the adapter's sink).
+    var lastPendingSyncEndedAt: Int? = nil
 }
 
 protocol HubDataSource: AnyObject {
@@ -119,6 +121,7 @@ actor HubUploadEngine {
         let hold = HubHoldPolicy.decide(trigger: trigger, now: nowTs, backfilling: ctx.backfilling,
                                         historyPendingSync: ctx.historyPendingSync,
                                         lastBackfillingEndedAt: ctx.lastBackfillingEndedAt,
+                                        lastPendingSyncEndedAt: ctx.lastPendingSyncEndedAt,
                                         memory: state.holdMemory)
         if state.holdMemory != hold.memory { state.holdMemory = hold.memory }
         // A held run sends no band data, so it gets no exemption from the 10-minute floor: a deep offload
@@ -155,7 +158,7 @@ actor HubUploadEngine {
         // Keyed tables: rows whose hash differs from the acked one.
         var pendingDaily = ctx.daily.map(HubBatchBuilder.daily).filter {
             let h = HubWire.rowHash(HubWire.daily($0))
-            return w.rowHash(.daily, $0.day) != h && !w.isRejected(.daily, $0.day, h)
+            return w.rowHash(.daily, $0.day) != h && !w.isRejected(now: nowTs, .daily, $0.day, h)
         }
         // R23 sleep windows: one per local day over the last 14 days (never older than the oldest loaded
         // session), sent whole whenever its content hash differs from the acked one, including emptied.
@@ -180,7 +183,7 @@ actor HubUploadEngine {
             pendingWindows.reverse()   // oldest first
             pendingSeeds = rows.filter { r in
                 let h = HubWire.rowHash(HubWire.sleep(r)), k = String(r.startTs)
-                return r.startTs < windowStart && w.rowHash(.sleep, k) != h && !w.isRejected(.sleep, k, h)
+                return r.startTs < windowStart && w.rowHash(.sleep, k) != h && !w.isRejected(now: nowTs, .sleep, k, h)
             }
         }
         // Streams: acked segments whose fingerprint changed since (late backfill). Late rows only arrive
@@ -290,18 +293,18 @@ actor HubUploadEngine {
             var acked: (resp: HubServerResponse, payload: HubPayload, window: (window: HubSleepWindow, rows: [HubSleepRow], hash: String)?)?
             attempt: while true {
                 var payload = HubPayload(device: ctx.device)
-                payload.hrMinute = hrRows.filter { !w.isRejected(.hr_minute, String($0.t), HubWire.rowHash(HubWire.hr($0))) }
-                payload.events = evRows.filter { !w.isRejected(.events, "\($0.t)|\($0.kind)", HubWire.rowHash(HubWire.event($0))) }
-                payload.battery = batRows.filter { !w.isRejected(.battery, String($0.t), HubWire.rowHash(HubWire.battery($0))) }
+                payload.hrMinute = hrRows.filter { !w.isRejected(now: nowTs, .hr_minute, String($0.t), HubWire.rowHash(HubWire.hr($0))) }
+                payload.events = evRows.filter { !w.isRejected(now: nowTs, .events, "\($0.t)|\($0.kind)", HubWire.rowHash(HubWire.event($0))) }
+                payload.battery = batRows.filter { !w.isRejected(now: nowTs, .battery, String($0.t), HubWire.rowHash(HubWire.battery($0))) }
                 payload.daily = Array(pendingDaily.prefix(Self.maxKeyedRowsPerRequest))
                 let window = pendingWindows.first
                 payload.sleepWindow = window?.window
                 payload.sleep = window?.rows ?? Array(pendingSeeds.prefix(Self.maxKeyedRowsPerRequest))
                 if sent == 0 {
-                    payload.steps = ctx.steps.filter { !w.isRejected(.steps, $0.day, HubWire.rowHash(HubWire.step($0))) }
+                    payload.steps = ctx.steps.filter { !w.isRejected(now: nowTs, .steps, $0.day, HubWire.rowHash(HubWire.step($0))) }
                 }
                 let (clean, dropped) = HubBounds.sanitize(payload, now: nowTs)
-                for d in dropped { w.reject(d.table, d.key, d.hash) }
+                for d in dropped { w.reject(at: nowTs, d.table, d.key, d.hash) }
                 state.noteSkipped(dropped.count, "Skipped an invalid row")
                 // Rows dropped here are gone from this request; keyed queues must not wait for them.
                 if !dropped.isEmpty {
@@ -339,7 +342,7 @@ actor HubUploadEngine {
                         guard let k = HubBounds.key(table, payload, i) else {
                             return formatRejected(.rejectedField(field), now: now, nowTs: nowTs, w: &w)
                         }
-                        w.reject(table, k.key, k.hash)
+                        w.reject(at: nowTs, table, k.key, k.hash)
                         switch table {
                         case .daily: pendingDaily.removeAll { $0.day == k.key }
                         case .sleep: pendingSeeds.removeAll { String($0.startTs) == k.key }
@@ -370,6 +373,16 @@ actor HubUploadEngine {
             }
             guard let ackedRequest = acked else { break }
             let (resp, payload, window) = ackedRequest
+            // A segment holding a row that was skipped (quarantined or dropped) gets no mark, so the late scan
+            // revisits it and the row's 24-hour retry can happen even after the watermark moved past it.
+            let skippedTs: [HubStream: [Int]] = [
+                .hr_minute: Set(hrRows.map(\.t)).subtracting(payload.hrMinute.map(\.t)).sorted(),
+                .events: Set(evRows.map(\.t)).subtracting(payload.events.map(\.t)).sorted(),
+                .battery: Set(batRows.map(\.t)).subtracting(payload.battery.map(\.t)).sorted(),
+            ]
+            for (st, ts) in skippedTs where !ts.isEmpty {
+                hourMarks[st] = hourMarks[st]?.filter { mark in !ts.contains { $0 >= mark.0 && $0 <= mark.1.clip } }
+            }
             do {
                 guard Self.applyAck(resp, payload: payload, hourMarks: hourMarks, to: &w) else {
                     state.recordUploadFailure(at: now(), reason: HubFailure.badResponse.reason)
