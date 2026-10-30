@@ -27,7 +27,10 @@ enum HubFailure: Equatable {
     case notConfigured
     case unauthorized(Int)
     case tooLarge
+    /// A 422 the phone can't attribute to one row (FORBIDDEN_FIELD, no or malformed `error.field`).
     case rejected
+    /// A 422 whose `error.field` is a well-formed schema path (`$.battery[3].soc`). Never shown raw.
+    case rejectedField(String)
     case rateLimited
     case serverLimit(String)
     case http(Int)
@@ -42,7 +45,7 @@ enum HubFailure: Equatable {
         case .notConfigured: return "Hub URL or token missing"
         case .unauthorized(let c): return "Token refused (HTTP \(c))"
         case .tooLarge: return "Batch too large (HTTP 413)"
-        case .rejected: return "Batch rejected (HTTP 422)"
+        case .rejected, .rejectedField: return "Batch rejected (HTTP 422)"
         case .rateLimited: return "Rate limited (HTTP 429)"
         case .serverLimit(let code): return "Hub database unavailable (\(code))"
         case .http(let c): return "HTTP \(c)"
@@ -140,7 +143,7 @@ struct HubClient {
             return .acked(r)
         case 401, 403: return .failed(.unauthorized(status))
         case 413: return .failed(.tooLarge)
-        case 422: return .failed(.rejected)
+        case 422: return .failed(rejection(body))
         case 429: return .failed(.rateLimited)
         case 503:
             // Only the two codes the contract names are echoed; anything else stays generic.
@@ -148,6 +151,16 @@ struct HubClient {
             return .failed(.serverLimit(code == "D1_LIMIT" || code == "D1_ERROR" ? code! : "HTTP 503"))
         default: return .failed(.http(status))
         }
+    }
+
+    /// The server's 422 body is `{code, error:{code, message, field, reason}}`: only `code` is top-level.
+    /// `field` is accepted only for code INVALID and only as a schema path (no values).
+    static func rejection(_ body: Data) -> HubFailure {
+        guard let o = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              o["code"] as? String == "INVALID",
+              let err = o["error"] as? [String: Any], err["code"] as? String == "INVALID",
+              let field = err["field"] as? String, HubRejectTarget.isSchemaPath(field) else { return .rejected }
+        return .rejectedField(field)
     }
 
     static func parse(_ body: Data) -> HubServerResponse? {

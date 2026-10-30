@@ -64,6 +64,9 @@ actor HubUploadEngine {
     static let sleepWindowDays = 14              // R23 windows: the band's buffer
     /// R26 addendum: a window's start must be >= now − 13 days (the server refuses < now − 14 days).
     static let sleepWindowMaxAge = 13 * 86_400
+    static let formatRetryInterval = 3_600
+    /// Rows a single request may have refused one by one before the run gives up for now.
+    static let maxQuarantinesPerRun = 20
 
     let source: HubDataSource
     let client: HubClient
@@ -107,13 +110,17 @@ actor HubUploadEngine {
         var w = marks.load()
         guard Self.shouldRun(trigger: trigger, now: nowTs, lastAttemptAt: w.lastAttemptAt,
                              catchUpPending: w.catchUpPending, dataLandedAt: dataLandedAt) else { return .skipped("throttled") }
+        // The hub refused the phone's status/format with nothing attributable: that only a new build fixes,
+        // so retry at most hourly (always on "Upload now").
+        if trigger != .manual, let r = w.formatRejectedAt, nowTs - r < Self.formatRetryInterval, nowTs >= r {
+            return .skipped("rejected format: retry hourly")
+        }
         guard let ctx = await source.context(now: nowTs) else { return .skipped("store not ready") }
         let hold = HubHoldPolicy.decide(trigger: trigger, now: nowTs, backfilling: ctx.backfilling,
                                         historyPendingSync: ctx.historyPendingSync,
                                         lastBackfillingEndedAt: ctx.lastBackfillingEndedAt,
-                                        holdingSince: state.holdingSince.map { Int($0.timeIntervalSince1970) })
-        let since = hold.holdingSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }
-        if state.holdingSince != since { state.holdingSince = since }
+                                        memory: state.holdMemory)
+        if state.holdMemory != hold.memory { state.holdMemory = hold.memory }
         // A held run sends no band data, so it gets no exemption from the 10-minute floor: a deep offload
         // fires the backfill hook once per ~60 s pass and must not turn into ~24 near-empty uploads.
         if hold.hold && !Self.shouldRun(trigger: trigger, now: nowTs, lastAttemptAt: w.lastAttemptAt,
@@ -147,17 +154,23 @@ actor HubUploadEngine {
         let streams: [HubStream] = hold ? [] : HubStream.allCases
         // Keyed tables: rows whose hash differs from the acked one.
         var pendingDaily = ctx.daily.map(HubBatchBuilder.daily).filter {
-            w.rowHash(.daily, $0.day) != HubWire.rowHash(HubWire.daily($0))
+            let h = HubWire.rowHash(HubWire.daily($0))
+            return w.rowHash(.daily, $0.day) != h && !w.isRejected(.daily, $0.day, h)
         }
         // R23 sleep windows: one per local day over the last 14 days (never older than the oldest loaded
         // session), sent whole whenever its content hash differs from the acked one, including emptied.
         var pendingWindows: [(window: HubSleepWindow, rows: [HubSleepRow], hash: String)] = []
+        // Sessions older than the window range go as plain upserts (no window, nothing superseded), once
+        // per content: the first install's history, over the same span as the daily rows.
+        var pendingSeeds: [HubSleepRow] = []
         if ctx.sleepLoaded, let oldest = ctx.sleep.map(\.startTs).min() {
             let rows = HubBatchBuilder.sleep(ctx.sleep, timeZone: tz)
             let floor = HubBatchBuilder.startOfLocalDay(oldest, tz)
             var win = HubBatchBuilder.sleepWindow(containing: nowTs, tz)
             let ageFloor = nowTs - Self.sleepWindowMaxAge
+            var windowStart = win.from
             for _ in 0..<Self.sleepWindowDays where win.from >= floor && win.from >= ageFloor {
+                windowStart = win.from
                 let inWin = rows.filter { $0.startTs >= win.from && $0.startTs < win.to }
                 let hash = HubWire.windowHash(inWin)
                 let key = String(win.from)
@@ -165,6 +178,10 @@ actor HubUploadEngine {
                 win = HubBatchBuilder.sleepWindow(containing: win.from - 1, tz)
             }
             pendingWindows.reverse()   // oldest first
+            pendingSeeds = rows.filter { r in
+                let h = HubWire.rowHash(HubWire.sleep(r)), k = String(r.startTs)
+                return r.startTs < windowStart && w.rowHash(.sleep, k) != h && !w.isRejected(.sleep, k, h)
+            }
         }
         // Streams: acked segments whose fingerprint changed since (late backfill). Late rows only arrive
         // through a strap offload, so the scan runs for a backfill (and "Upload now"), not every foreground.
@@ -197,6 +214,7 @@ actor HubUploadEngine {
         }
 
         var sent = 0
+        var quarantines = 0
         var forwardDone = streams.isEmpty
         while sent < Self.maxRequestsPerRun {
             guard shouldContinue() else {
@@ -238,7 +256,7 @@ actor HubUploadEngine {
             }
             // Always send at least one request per run (it carries device status and steps, and brings
             // back the lock flag and renewal estimate); after that, only while there is something to send.
-            if chunk.isEmpty && sent > 0 && pendingDaily.isEmpty && pendingWindows.isEmpty { break }
+            if chunk.isEmpty && sent > 0 && pendingDaily.isEmpty && pendingWindows.isEmpty && pendingSeeds.isEmpty { break }
 
             // Fingerprint BEFORE reading rows: a row landing in between makes the stored mark stale, which
             // only ever causes a harmless resend later, never a skipped row. Marks are per segment.
@@ -256,62 +274,117 @@ actor HubUploadEngine {
                 let fps = spans.isEmpty ? [] : try await source.fingerprints(s, ranges: spans)
                 hourMarks[s] = zip(spans, fps).map { ($0.lowerBound, HubHourMark(clip: $0.upperBound, fp: $1)) }
             }
-            var payload = HubPayload(device: ctx.device)
+            var hrRows: [HubHRMinute] = [], evRows: [HubEventRow] = [], batRows: [HubBatteryRow] = []
             for r in chunk.ranges[.hr_minute] ?? [] {
-                payload.hrMinute += HubBatchBuilder.minuteAggregates(try await source.hrSamples(from: r.lowerBound, to: r.upperBound))
+                hrRows += HubBatchBuilder.minuteAggregates(try await source.hrSamples(from: r.lowerBound, to: r.upperBound))
             }
             for r in chunk.ranges[.events] ?? [] {
-                payload.events += HubBatchBuilder.events(try await source.events(from: r.lowerBound, to: r.upperBound))
+                evRows += HubBatchBuilder.events(try await source.events(from: r.lowerBound, to: r.upperBound))
             }
             for r in chunk.ranges[.battery] ?? [] {
-                payload.battery += HubBatchBuilder.battery(try await source.battery(from: r.lowerBound, to: r.upperBound))
+                batRows += HubBatchBuilder.battery(try await source.battery(from: r.lowerBound, to: r.upperBound))
             }
-            payload.daily = Array(pendingDaily.prefix(Self.maxKeyedRowsPerRequest))
-            let window = pendingWindows.first
-            payload.sleepWindow = window?.window
-            payload.sleep = window?.rows ?? []
-            if sent == 0 { payload.steps = ctx.steps }
 
-            let result: HubSendResult
-            if payload.hrMinute.count > HubBatchBuilder.maxHRRowsPerRequest {
-                result = .failed(.tooLarge)
-            } else if let json = try? HubWire.encode(payload) {
-                result = json.count > HubBatchBuilder.maxBytesPerRequest
-                    ? .failed(.tooLarge) : await client.send(json: json, base: base)
-            } else {
-                result = .failed(.encoding)
-            }
-            switch result {
-            case .cancelled:
-                w.catchUpPending = true; marks.save(w)
-                return .cancelled
-            case .failed(let f):
-                if f == .rejected, let win = window {
-                    // R26: the whole request was refused and it carried a window. Drop that window (with this
-                    // content) from future requests, so it can't block HR/daily on every retry. The next run
-                    // resends the rest without it.
-                    w.rejectedWindows[String(win.window.from)] = win.hash
-                    state.recordUploadFailure(at: now(), reason: "Sleep window rejected (HTTP 422); dropped")
+            // Build, sanitize, send. A 422 that names one row (or the window) skips exactly that and the
+            // same request is retried without it; anything else ends the run.
+            var acked: (resp: HubServerResponse, payload: HubPayload, window: (window: HubSleepWindow, rows: [HubSleepRow], hash: String)?)?
+            attempt: while true {
+                var payload = HubPayload(device: ctx.device)
+                payload.hrMinute = hrRows.filter { !w.isRejected(.hr_minute, String($0.t), HubWire.rowHash(HubWire.hr($0))) }
+                payload.events = evRows.filter { !w.isRejected(.events, "\($0.t)|\($0.kind)", HubWire.rowHash(HubWire.event($0))) }
+                payload.battery = batRows.filter { !w.isRejected(.battery, String($0.t), HubWire.rowHash(HubWire.battery($0))) }
+                payload.daily = Array(pendingDaily.prefix(Self.maxKeyedRowsPerRequest))
+                let window = pendingWindows.first
+                payload.sleepWindow = window?.window
+                payload.sleep = window?.rows ?? Array(pendingSeeds.prefix(Self.maxKeyedRowsPerRequest))
+                if sent == 0 {
+                    payload.steps = ctx.steps.filter { !w.isRejected(.steps, $0.day, HubWire.rowHash(HubWire.step($0))) }
+                }
+                let (clean, dropped) = HubBounds.sanitize(payload, now: nowTs)
+                for d in dropped { w.reject(d.table, d.key, d.hash) }
+                state.noteSkipped(dropped.count, "Skipped an invalid row")
+                // Rows dropped here are gone from this request; keyed queues must not wait for them.
+                if !dropped.isEmpty {
+                    let gone = Set(dropped.map { "\($0.table.rawValue)|\($0.key)" })
+                    pendingDaily.removeAll { gone.contains("daily|\($0.day)") }
+                    pendingSeeds.removeAll { gone.contains("sleep|\($0.startTs)") }
+                }
+                payload = clean
+
+                let result: HubSendResult
+                if payload.hrMinute.count > HubBatchBuilder.maxHRRowsPerRequest {
+                    result = .failed(.tooLarge)
+                } else if let json = try? HubWire.encode(payload) {
+                    result = json.count > HubBatchBuilder.maxBytesPerRequest
+                        ? .failed(.tooLarge) : await client.send(json: json, base: base)
+                } else {
+                    result = .failed(.encoding)
+                }
+                switch result {
+                case .cancelled:
+                    w.catchUpPending = true; marks.save(w)
+                    return .cancelled
+                case .failed(.rejectedField(let field)) where quarantines < Self.maxQuarantinesPerRun:
+                    switch HubRejectTarget.parse(field) {
+                    case .window where window != nil:
+                        w.rejectedWindows[String(window!.window.from)] = window!.hash
+                        pendingWindows.removeFirst()
+                        state.noteSkipped(1, "Hub refused a sleep window; skipped")
+                    case .row(.sleep, _) where window != nil:
+                        // A row inside a window: the window (with this content) is what gets skipped.
+                        w.rejectedWindows[String(window!.window.from)] = window!.hash
+                        pendingWindows.removeFirst()
+                        state.noteSkipped(1, "Hub refused a sleep window; skipped")
+                    case .row(let table, let i):
+                        guard let k = HubBounds.key(table, payload, i) else {
+                            return formatRejected(.rejectedField(field), now: now, nowTs: nowTs, w: &w)
+                        }
+                        w.reject(table, k.key, k.hash)
+                        switch table {
+                        case .daily: pendingDaily.removeAll { $0.day == k.key }
+                        case .sleep: pendingSeeds.removeAll { String($0.startTs) == k.key }
+                        default: break
+                        }
+                        state.noteSkipped(1, table == .daily || table == .sleep || table == .steps
+                                          ? "Hub refused one \(table == .daily ? "daily" : table == .sleep ? "sleep" : "steps") row; skipped"
+                                          : "Hub refused one band row; skipped")
+                    default:
+                        return formatRejected(.rejectedField(field), now: now, nowTs: nowTs, w: &w)
+                    }
+                    quarantines += 1
+                    marks.save(w)
+                    continue attempt
+                case .failed(.rejectedField(let field)):
+                    return formatRejected(.rejectedField(field), now: now, nowTs: nowTs, w: &w)
+                case .failed(.rejected):
+                    return formatRejected(.rejected, now: now, nowTs: nowTs, w: &w)
+                case .failed(let f):
+                    state.recordUploadFailure(at: now(), reason: f.reason)
                     marks.save(w)
                     afterAttempt()
                     return .failed(f)
+                case .acked(let resp):
+                    acked = (resp, payload, window)
+                    break attempt
                 }
-                state.recordUploadFailure(at: now(), reason: f.reason)
-                marks.save(w)
-                afterAttempt()
-                return .failed(f)
-            case .acked(let resp):
+            }
+            guard let ackedRequest = acked else { break }
+            let (resp, payload, window) = ackedRequest
+            do {
                 guard Self.applyAck(resp, payload: payload, hourMarks: hourMarks, to: &w) else {
                     state.recordUploadFailure(at: now(), reason: HubFailure.badResponse.reason)
                     marks.save(w)
                     afterAttempt()
                     return .failed(.badResponse)
                 }
-                pendingDaily.removeFirst(payload.daily.count)
+                w.formatRejectedAt = nil
+                pendingDaily.removeAll { d in payload.daily.contains { $0.day == d.day } }
                 if let win = window {
                     // Confirmed by this 2xx + parseable ack (one batch server-side), even with zero rows.
                     w.windows[String(win.window.from)] = win.hash
                     pendingWindows.removeFirst()
+                } else {
+                    pendingSeeds.removeAll { r in payload.sleep.contains { $0.startTs == r.startTs } }
                 }
                 if !chunk.isResend {
                     for (s, rs) in chunk.ranges { if let last = rs.last { cursor[s] = last.upperBound + 1 } }
@@ -326,12 +399,22 @@ actor HubUploadEngine {
         w.catchUpPending = more
         var keep: [HubTable: Set<String>] = [:]
         if !ctx.daily.isEmpty { keep[.daily] = Set(ctx.daily.map(\.day)) }
-        w.rows[HubTable.sleep.rawValue] = nil   // per-row sleep hashes are superseded by R23 windows
+        if !ctx.sleep.isEmpty { keep[.sleep] = Set(ctx.sleep.map { String($0.startTs) }) }
         w.prune(hoursBefore: HubBatchBuilder.floorHour(nowTs - Self.hourLookback - 3_600), keepRowKeys: keep,
                 windowsBefore: HubBatchBuilder.startOfLocalDay(nowTs - (Self.sleepWindowDays + 1) * 86_400, tz))
         marks.save(w)
         afterAttempt()
         return .uploaded(requests: sent, more: more)
+    }
+
+    /// A 422 with nothing identifiable to skip (device/format, FORBIDDEN_FIELD, a malformed path): a phone
+    /// bug only a new build fixes. Nothing advances; retried at most hourly; shown in Settings.
+    private func formatRejected(_ f: HubFailure, now: () -> Date, nowTs: Int, w: inout HubWatermarks) -> HubRunOutcome {
+        w.formatRejectedAt = nowTs
+        state.recordUploadFailure(at: now(), reason: "Hub rejected the phone's status/format")
+        marks.save(w)
+        afterAttempt()
+        return .failed(f)
     }
 
     /// Moves watermarks for one acked request. A table that carried rows counts as acked only when the
@@ -362,6 +445,9 @@ actor HubUploadEngine {
             for (h, mark) in hourMarks[s] ?? [] { w.setHourMark(s, h, mark) }
         }
         for row in payload.daily { w.rows[HubTable.daily.rawValue, default: [:]][row.day] = HubWire.rowHash(HubWire.daily(row)) }
+        if payload.sleepWindow == nil {   // plain seed upserts: remember each row's content
+            for row in payload.sleep { w.rows[HubTable.sleep.rawValue, default: [:]][String(row.startTs)] = HubWire.rowHash(HubWire.sleep(row)) }
+        }
         return true
     }
 

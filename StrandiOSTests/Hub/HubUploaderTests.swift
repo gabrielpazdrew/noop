@@ -845,21 +845,67 @@ final class HubUploaderTests: XCTestCase {
 
     func testHoldPolicy() {
         let now = 100_000
-        func d(_ t: HubTrigger, bf: Bool = false, pend: Bool = false, ended: Int? = nil, since: Int? = nil) -> HubHoldDecision {
+        func d(_ t: HubTrigger, bf: Bool = false, pend: Bool = false, ended: Int? = nil,
+               mem: HubHoldMemory = HubHoldMemory()) -> HubHoldDecision {
             HubHoldPolicy.decide(trigger: t, now: now, backfilling: bf, historyPendingSync: pend,
-                                 lastBackfillingEndedAt: ended, holdingSince: since)
+                                 lastBackfillingEndedAt: ended, memory: mem)
         }
-        XCTAssertEqual(d(.foreground), HubHoldDecision(hold: false, holdingSince: nil, capped: false))
-        XCTAssertEqual(d(.foreground, bf: true), HubHoldDecision(hold: true, holdingSince: now, capped: false))
-        XCTAssertEqual(d(.backfill, pend: true), HubHoldDecision(hold: true, holdingSince: now, capped: false))
+        XCTAssertEqual(d(.foreground), HubHoldDecision(hold: false, memory: HubHoldMemory(), capped: false))
+        XCTAssertEqual(d(.foreground, bf: true),
+                       HubHoldDecision(hold: true, memory: HubHoldMemory(holdingSince: now, lastSeen: now), capped: false))
+        XCTAssertEqual(d(.backfill, pend: true),
+                       HubHoldDecision(hold: true, memory: HubHoldMemory(holdingSince: now, lastSeen: now, pendingSince: now), capped: false))
         // 120 s quiet window after an offload ends: foreground and manual wait, the backfill trigger doesn't.
         XCTAssertTrue(d(.foreground, ended: now - 119).hold)
         XCTAssertTrue(d(.manual, ended: now - 60).hold)
         XCTAssertFalse(d(.backfill, ended: now - 60).hold)
         XCTAssertFalse(d(.foreground, ended: now - 121).hold)
-        // A continuous hold is capped at 2 h: then it sends anyway, keeping the start so Settings can show it.
-        XCTAssertEqual(d(.foreground, bf: true, since: now - 7_199), HubHoldDecision(hold: true, holdingSince: now - 7_199, capped: false))
-        XCTAssertEqual(d(.foreground, bf: true, since: now - 7_200), HubHoldDecision(hold: false, holdingSince: now - 7_200, capped: true))
+        // A continuous pending-sync hold is capped at 2 h: then it sends anyway, keeping the start for Settings.
+        let cont = HubHoldMemory(holdingSince: now - 7_199, lastSeen: now - 300, pendingSince: now - 7_199)
+        XCTAssertTrue(d(.foreground, pend: true, mem: cont).hold)
+        let long = HubHoldMemory(holdingSince: now - 7_200, lastSeen: now - 300, pendingSince: now - 7_200)
+        let capped = d(.foreground, pend: true, mem: long)
+        XCTAssertFalse(capped.hold); XCTAssertTrue(capped.capped); XCTAssertEqual(capped.memory.holdingSince, now - 7_200)
+        // A running offload is never capped (NOOP clears `backfilling` on every exit and disconnect).
+        XCTAssertTrue(d(.foreground, bf: true, mem: long).hold)
+    }
+
+    /// Re-review 2 Important 2: a hold whose end no run observed must not start the next hold "already capped".
+    func testStaleHoldStartDoesNotCapANewHold() {
+        let t = 100_000
+        let stale = HubHoldMemory(holdingSince: t, lastSeen: t)              // last seen holding at T, end never observed
+        let later = HubHoldPolicy.decide(trigger: .foreground, now: t + 3 * 3600, backfilling: false, historyPendingSync: true,
+                                         lastBackfillingEndedAt: nil, memory: stale)
+        XCTAssertTrue(later.hold)
+        XCTAssertEqual(later.memory.holdingSince, t + 3 * 3600)           // a new hold: the cap clock restarts
+        // …but a latched pending flag seen on sparse runs (15 min apart, past the 10-minute gap) still caps.
+        var mem = HubHoldMemory()
+        var sentAt: Int?
+        for k in 0...10 {
+            let now = t + k * 900
+            let dd = HubHoldPolicy.decide(trigger: .backfill, now: now, backfilling: false, historyPendingSync: true,
+                                          lastBackfillingEndedAt: nil, memory: mem)
+            mem = dd.memory
+            if !dd.hold && sentAt == nil { sentAt = now }
+        }
+        XCTAssertEqual(sentAt, t + 8 * 900)                                 // 2 h after the flag was first seen
+    }
+
+    /// Engine level: offload A ends by disconnect with no upload; 3 h later offload B starts; nothing is sent
+    /// mid-sync.
+    func testNewOffloadAfterAnUnobservedEndIsHeld() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        _ = run(e, at: dayStart + 700)
+        src.backfilling = true
+        _ = run(e, .manual, at: dayStart + 1400)                            // hold seen
+        // Offload A ends by disconnect: no backfill hook, no run sees it end.
+        let later = dayStart + 1400 + 3 * 3600
+        src.hr += hrSeries(later - 600, later)
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: later)                                      // offload B running
+        XCTAssertEqual(minutes(tr.bodies), [])
     }
 
     func testHoldStatusIsVisibleAndCleared() {
@@ -954,13 +1000,13 @@ final class HubUploaderTests: XCTestCase {
         let badFrom = HubBatchBuilder.startOfLocalDay(dayStart - 5 * 3600, tz)
         tr.respond = { j in
             if let w = j["sleep_window"] as? [String: Any], w["from"] as? Int == badFrom {
-                return (422, Data("{\"error\":\"invalid\"}".utf8))
+                return (422, Data("{\"code\":\"INVALID\",\"error\":{\"code\":\"INVALID\",\"message\":\"invalid request\",\"field\":\"$.sleep_window.from\",\"reason\":\"range\"}}".utf8))
             }
             return FakeTransport.ackAll(j)
         }
         let first = run(e, at: now)
-        XCTAssertEqual(first, .failed(.rejected))
-        XCTAssertEqual(state.lastUploadResult, "Sleep window rejected (HTTP 422); dropped")
+        if case .failed = first {} else { if case .uploaded = first {} else { XCTFail("\(first)") } }
+        XCTAssertEqual(state.lastSkipped, "Hub refused a sleep window; skipped")
         XCTAssertNotNil(marks.load().rejectedWindows[String(badFrom)])
         tr.bodies.removeAll()
         let second = run(e, .manual, at: now + 60)
@@ -976,5 +1022,163 @@ final class HubUploaderTests: XCTestCase {
         tr.bodies.removeAll()
         _ = run(e, .manual, at: now + 180)
         XCTAssertTrue(windows(tr.bodies).contains { $0.from == badFrom })
+    }
+
+    // MARK: fix round 4 — one bad row never wedges uploads
+
+    static func invalid422(_ field: String) -> (Int, Data) {
+        (422, Data("{\"code\":\"INVALID\",\"error\":{\"code\":\"INVALID\",\"message\":\"invalid request\",\"field\":\"\(field)\",\"reason\":\"range\"}}".utf8))
+    }
+
+    func testClassify422Paths() {
+        func c(_ body: String) -> HubSendResult { HubClient.classify(status: 422, body: Data(body.utf8)) }
+        XCTAssertEqual(c(#"{"code":"INVALID","error":{"code":"INVALID","field":"$.battery[3].soc","reason":"range"}}"#),
+                       .failed(.rejectedField("$.battery[3].soc")))
+        XCTAssertEqual(c(#"{"code":"INVALID","error":{"code":"INVALID","field":"$.device.band_fw","reason":"format"}}"#),
+                       .failed(.rejectedField("$.device.band_fw")))
+        XCTAssertEqual(c(#"{"code":"FORBIDDEN_FIELD","error":{"code":"FORBIDDEN_FIELD","field":"$.daily[0].spo2"}}"#), .failed(.rejected))
+        XCTAssertEqual(c(#"{"code":"INVALID","error":{"code":"INVALID","field":"$.battery[0].soc 255","reason":"range"}}"#), .failed(.rejected))
+        XCTAssertEqual(c(#"{"code":"INVALID","field":"$.battery[0].soc"}"#), .failed(.rejected))   // field must be under error
+        XCTAssertEqual(c("not json"), .failed(.rejected))
+        XCTAssertEqual(HubRejectTarget.parse("$.battery[3].soc"), .row(.battery, 3))
+        XCTAssertEqual(HubRejectTarget.parse("$.hr_minute[0].mean"), .row(.hr_minute, 0))
+        XCTAssertEqual(HubRejectTarget.parse("$.sleep_window.to"), .window)
+        XCTAssertEqual(HubRejectTarget.parse("$.sleep[2].start_ts"), .row(.sleep, 2))
+        XCTAssertEqual(HubRejectTarget.parse("$.device.tz"), .unattributable)
+        XCTAssertEqual(HubRejectTarget.parse("$"), .unattributable)
+        XCTAssertEqual(HubRejectTarget.parse("$.schema"), .unattributable)
+    }
+
+    func testSanitizerNullsImpossibleOptionalsAndDropsBadRows() {
+        let now = dayStart + 12 * 3600
+        var p = fullPayload()
+        p.device.bandBattery = 140
+        p.device.bandFw = "fw\u{1F600}"
+        p.battery = [HubBatteryRow(t: now - 60, soc: 255, mv: 20_000, charging: 1),
+                     HubBatteryRow(t: now + 3 * 86_400, soc: 50, mv: 3900, charging: nil)]      // future: dropped
+        p.daily[0].skinTempDevC = 15
+        p.daily[0].restingHr = 400
+        p.daily.append(HubBatchBuilder.daily(HubDailyInput(day: "2030-02-20", recovery: 50, strain: nil, restingHr: nil,
+                                                           avgHrv: nil, avgSdnn: nil, respRateBpm: nil, skinTempDevC: nil,
+                                                           totalSleepMin: nil, efficiency: nil, disturbances: nil,
+                                                           exerciseCount: nil, steps: nil, activeKcalEst: nil)))  // future day
+        p.hrMinute.append(HubHRMinute(t: now - 120, mean: 300, min: 250, max: 350, n: 5))                 // impossible HR
+        p.steps = [HubStepRow(day: "2030-01-15", steps: 5_000_000, distanceM: -3, flights: 7)]
+        let (clean, dropped) = HubBounds.sanitize(p, now: now)
+        XCTAssertNil(clean.device.bandBattery)
+        XCTAssertNil(clean.device.bandFw)
+        XCTAssertEqual(clean.battery, [HubBatteryRow(t: now - 60, soc: nil, mv: nil, charging: 1)])
+        XCTAssertNil(clean.daily[0].skinTempDevC)
+        XCTAssertNil(clean.daily[0].restingHr)
+        XCTAssertEqual(clean.daily.map(\.day), ["2030-01-15"])
+        XCTAssertFalse(clean.hrMinute.contains { $0.mean > 255 })
+        XCTAssertEqual(clean.steps, [HubStepRow(day: "2030-01-15", steps: nil, distanceM: nil, flights: 7)])
+        XCTAssertEqual(dropped.count, 3)
+        XCTAssertNotNil(try? HubWire.encode(clean))
+    }
+
+    func testBadDailyRowFromTheStoreIsDroppedCountedAndNotRetried() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 12 * 3600
+        src.daily = [HubDailyInput(day: "2030-03-01", recovery: 50, strain: nil, restingHr: nil, avgHrv: nil, avgSdnn: nil,
+                                   respRateBpm: nil, skinTempDevC: nil, totalSleepMin: nil, efficiency: nil, disturbances: nil,
+                                   exerciseCount: nil, steps: nil, activeKcalEst: nil)]          // a future-clock strap's day
+        _ = run(e, at: now)
+        XCTAssertTrue(tr.bodies.allSatisfy { ($0["daily"] as! [Any]).isEmpty })
+        XCTAssertEqual(state.skippedRows, 1)
+        _ = run(e, .manual, at: now + 60)
+        XCTAssertEqual(state.skippedRows, 1)                          // quarantined, not re-counted every run
+        XCTAssertEqual(state.lastUploadOK, true)
+    }
+
+    /// The coordinator's test: a battery row the server refuses no longer drops the sleep window and no
+    /// longer blocks the next upload.
+    func testBatteryRow422SkipsOnlyThatRowAndKeepsTheWindow() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 12 * 3600
+        src.sleep = [night(dayStart - 5 * 3600)]
+        src.hr = hrSeries(now - 1800, now)
+        let badT = now - 900
+        src.bat = [HubBatteryInput(ts: now - 1200, soc: 60, mv: 3900, charging: nil),
+                   HubBatteryInput(ts: badT, soc: 59, mv: 3890, charging: nil)]
+        tr.respond = { j in
+            if let rows = j["battery"] as? [[String: Any]], let i = rows.firstIndex(where: { $0["t"] as? Int == badT }) {
+                return HubUploaderTests.invalid422("$.battery[\(i)].soc")       // the server disagrees about this row
+            }
+            return FakeTransport.ackAll(j)
+        }
+        let out = run(e, at: now)
+        if case .uploaded = out {} else { XCTFail("wedged: \(out)") }
+        let w = marks.load()
+        XCTAssertEqual(w.rejectedWindows, [:])                                    // the window was not blamed
+        XCTAssertNotNil(w.windows[String(HubBatchBuilder.startOfLocalDay(dayStart - 5 * 3600, tz))])
+        XCTAssertNotNil(w.streamMark(.hr_minute))
+        XCTAssertEqual(w.streamMark(.battery), now - 1200)
+        XCTAssertEqual(state.lastUploadOK, true)
+        XCTAssertEqual(state.skippedRows, 1)
+        XCTAssertEqual(state.lastSkipped, "Hub refused one band row; skipped")
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 60)
+        XCTAssertFalse(tr.bodies.contains { ($0["battery"] as! [[String: Any]]).contains { $0["t"] as? Int == badT } })
+        XCTAssertEqual(state.lastUploadOK, true)
+    }
+
+    func testDailyRow422SkipsOnlyThatDay() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        func d(_ day: String) -> HubDailyInput {
+            HubDailyInput(day: day, recovery: 50, strain: nil, restingHr: nil, avgHrv: nil, avgSdnn: nil, respRateBpm: nil,
+                          skinTempDevC: nil, totalSleepMin: nil, efficiency: nil, disturbances: nil, exerciseCount: nil,
+                          steps: nil, activeKcalEst: nil)
+        }
+        src.daily = [d("2030-01-13"), d("2030-01-14"), d("2030-01-15")]
+        tr.respond = { j in
+            if let rows = j["daily"] as? [[String: Any]], let i = rows.firstIndex(where: { $0["day"] as? String == "2030-01-14" }) {
+                return HubUploaderTests.invalid422("$.daily[\(i)].recovery")
+            }
+            return FakeTransport.ackAll(j)
+        }
+        let out = run(engine(src, tr), at: dayStart + 36_000)
+        if case .uploaded = out {} else { XCTFail("\(out)") }
+        XCTAssertEqual(Set((marks.load().rows["daily"] ?? [:]).keys), ["2030-01-13", "2030-01-15"])
+        XCTAssertNotNil(marks.load().rejectedRows["daily"]?["2030-01-14"])
+    }
+
+    func testUnattributable422RetriesHourlyAndShowsInSettings() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        src.hr = hrSeries(dayStart, dayStart + 600)
+        tr.respond = { _ in HubUploaderTests.invalid422("$.device.tz") }
+        XCTAssertEqual(run(e, at: dayStart + 700), .failed(.rejectedField("$.device.tz")))
+        XCTAssertEqual(state.lastUploadResult, "Hub rejected the phone's status/format")
+        XCTAssertEqual(marks.load().stream, [:])
+        XCTAssertEqual(run(e, .foreground, at: dayStart + 700 + 1_800), .skipped("rejected format: retry hourly"))
+        XCTAssertEqual(run(e, .backfill, at: dayStart + 700 + 1_900, dataLandedAt: dayStart + 700 + 1_890),
+                       .skipped("rejected format: retry hourly"))
+        XCTAssertEqual(run(e, .manual, at: dayStart + 700 + 2_000), .failed(.rejectedField("$.device.tz")))   // "Upload now" still tries
+        tr.respond = { FakeTransport.ackAll($0) }
+        if case .uploaded = run(e, .foreground, at: dayStart + 700 + 2_000 + 3_600) {} else { XCTFail("hourly retry") }
+        // A malformed path is unattributable too.
+        tr.respond = { _ in (422, Data(#"{"code":"INVALID","error":{"code":"INVALID","field":"battery 255"}}"#.utf8)) }
+        XCTAssertEqual(run(e, .manual, at: dayStart + 9_000), .failed(.rejected))
+        XCTAssertEqual(state.lastUploadResult, "Hub rejected the phone's status/format")
+    }
+
+    /// Re-review 2 Minor 3: sleep sessions older than the 13-day window go once as plain upserts (no window).
+    func testOldSleepSessionsAreSeededWithoutAWindow() {
+        let src = FakeHubSource(), tr = FakeTransport()
+        let e = engine(src, tr)
+        let now = dayStart + 10 * 3600
+        let old = [night(dayStart - 40 * 86_400), night(dayStart - 20 * 86_400)]
+        src.sleep = old + [night(dayStart - 5 * 3600)]
+        _ = run(e, at: now)
+        let seedBodies = tr.bodies.filter { $0["sleep_window"] == nil && !($0["sleep"] as! [Any]).isEmpty }
+        XCTAssertEqual(Set(seedBodies.flatMap { ($0["sleep"] as! [[String: Any]]).map { $0["start_ts"] as! Int } }),
+                       Set(old.map(\.startTs)))
+        XCTAssertTrue(windows(tr.bodies).allSatisfy { $0.from >= now - 13 * 86_400 })
+        tr.bodies.removeAll()
+        _ = run(e, .manual, at: now + 60)
+        XCTAssertTrue(tr.bodies.allSatisfy { ($0["sleep"] as! [Any]).isEmpty })   // acked: not resent
     }
 }

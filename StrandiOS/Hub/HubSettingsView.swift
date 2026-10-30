@@ -99,9 +99,16 @@ struct HubSettingsView: View {
                     Text("Failing since \(since.formatted(date: .abbreviated, time: .shortened)).")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
                 }
+                if state.skippedRows > 0 {
+                    Text("Rows skipped (invalid or refused by the hub): \(state.skippedRows). Last: \(state.lastSkipped ?? "").")
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                }
                 if let since = state.holdingSince {
-                    Text(Date().timeIntervalSince(since) >= TimeInterval(HubHoldPolicy.cap)
-                         ? "Holding: strap sync pending since \(since.formatted(date: .abbreviated, time: .shortened)). Band data is being sent anyway."
+                    let pendingSince = state.holdMemory.pendingSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+                    let capped = Date().timeIntervalSince(pendingSince ?? since) >= TimeInterval(HubHoldPolicy.cap)
+                        && !(AppModel.shared?.live.backfilling ?? false)
+                    Text(capped
+                         ? "Holding: strap sync pending since \((pendingSince ?? since).formatted(date: .abbreviated, time: .shortened)). Band data is being sent anyway."
                          : "Holding band data while the strap syncs (since \(since.formatted(date: .omitted, time: .shortened))).")
                         .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
                 }

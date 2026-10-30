@@ -23,6 +23,10 @@ final class HubState {
         static let tripwire = "hub.tripwire"
         static let openAlerts = "hub.openAlerts"
         static let holdingSince = "hub.holdingSince"
+        static let holdLastSeenAt = "hub.holdLastSeenAt"
+        static let pendingSyncSince = "hub.pendingSyncSince"
+        static let skippedRows = "hub.skippedRows"
+        static let lastSkipped = "hub.lastSkipped"
         static let renewalArmedFor = "hub.notice.renewalArmedFor"
         static let failureArmedFor = "hub.notice.failureArmedFor"
         static let lockedAlerted = "hub.notice.lockedAlerted"
@@ -83,6 +87,33 @@ final class HubState {
     var holdingSince: Date? {
         get { date(Key.holdingSince) }
         set { setDate(newValue, Key.holdingSince); changed() }
+    }
+
+    /// HubHoldPolicy's memory besides `holdingSince` (persisted so a background relaunch keeps it).
+    var holdMemory: HubHoldMemory {
+        get {
+            HubHoldMemory(holdingSince: holdingSince.map { Int($0.timeIntervalSince1970) },
+                          lastSeen: date(Key.holdLastSeenAt).map { Int($0.timeIntervalSince1970) },
+                          pendingSince: date(Key.pendingSyncSince).map { Int($0.timeIntervalSince1970) })
+        }
+        set {
+            let since = newValue.holdingSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            setDate(newValue.lastSeen.map { Date(timeIntervalSince1970: TimeInterval($0)) }, Key.holdLastSeenAt)
+            setDate(newValue.pendingSince.map { Date(timeIntervalSince1970: TimeInterval($0)) }, Key.pendingSyncSince)
+            if holdingSince != since { holdingSince = since }
+        }
+    }
+
+    /// Rows skipped so far (out of bounds locally, or refused by the hub), for Settings. Content-free.
+    var skippedRows: Int { defaults.integer(forKey: Key.skippedRows) }
+    /// Fixed vocabulary: "Skipped an invalid row", "Hub refused one band row; skipped", …
+    var lastSkipped: String? { defaults.string(forKey: Key.lastSkipped) }
+
+    func noteSkipped(_ count: Int, _ what: String) {
+        guard count > 0 else { return }
+        defaults.set(skippedRows + count, forKey: Key.skippedRows)
+        defaults.set(String(what.prefix(Self.maxReasonLength)), forKey: Key.lastSkipped)
+        changed()
     }
 
     func recordUploadSuccess(at time: Date) {

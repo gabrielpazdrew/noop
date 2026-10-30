@@ -39,13 +39,18 @@ struct HubWatermarks: Codable, Equatable {
     /// R26: windows the server refused (422), with the content hash refused. Never retried with that
     /// content, so one bad window can't block HR or daily uploads; new content gets one fresh try.
     var rejectedWindows: [String: String] = [:]
+    /// Rows the server refused (422 naming them) or that failed the local bounds (HubBounds), per table,
+    /// natural key → content hash. Skipped while the content is unchanged; new content gets one fresh try.
+    var rejectedRows: [String: [String: String]] = [:]
+    /// When the server last refused the phone's status/format with nothing attributable (retry hourly).
+    var formatRejectedAt: Int?
     /// The last run stopped with chunks still to send (catch-up), so the 10-minute floor doesn't apply.
     var catchUpPending = false
     var lastAttemptAt: Int?
 
     init() {}
 
-    private enum CodingKeys: String, CodingKey { case stream, hours, rows, windows, rejectedWindows, catchUpPending, lastAttemptAt }
+    private enum CodingKeys: String, CodingKey { case stream, hours, rows, windows, rejectedWindows, rejectedRows, formatRejectedAt, catchUpPending, lastAttemptAt }
 
     /// Tolerant: a field added in a later build decodes as empty instead of dropping every watermark.
     init(from decoder: Decoder) throws {
@@ -55,6 +60,8 @@ struct HubWatermarks: Codable, Equatable {
         rows = try c.decodeIfPresent([String: [String: String]].self, forKey: .rows) ?? [:]
         windows = try c.decodeIfPresent([String: String].self, forKey: .windows) ?? [:]
         rejectedWindows = try c.decodeIfPresent([String: String].self, forKey: .rejectedWindows) ?? [:]
+        rejectedRows = try c.decodeIfPresent([String: [String: String]].self, forKey: .rejectedRows) ?? [:]
+        formatRejectedAt = try c.decodeIfPresent(Int.self, forKey: .formatRejectedAt)
         catchUpPending = try c.decodeIfPresent(Bool.self, forKey: .catchUpPending) ?? false
         lastAttemptAt = try c.decodeIfPresent(Int.self, forKey: .lastAttemptAt)
     }
@@ -68,6 +75,15 @@ struct HubWatermarks: Codable, Equatable {
     }
 
     func rowHash(_ t: HubTable, _ key: String) -> String? { rows[t.rawValue]?[key] }
+
+    func isRejected(_ t: HubTable, _ key: String, _ hash: String) -> Bool { rejectedRows[t.rawValue]?[key] == hash }
+
+    mutating func reject(_ t: HubTable, _ key: String, _ hash: String) {
+        var m = rejectedRows[t.rawValue, default: [:]]
+        m[key] = hash
+        if m.count > 2_000 { m.removeValue(forKey: m.keys.min()!) }     // bounded
+        rejectedRows[t.rawValue] = m
+    }
 
     /// Advance a stream to `t`, never backwards.
     mutating func advance(_ s: HubStream, to t: Int) {
