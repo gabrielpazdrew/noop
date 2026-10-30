@@ -41,7 +41,7 @@ struct HubSettingsView: View {
                 .tint(StrandPalette.accent)
                 .onChange(of: enabled) { _, on in
                     state.enabled = on
-                    if on { HubNotifications.requestAuthorization() }
+                    if on { HubNotifications.requestAuthorization(); HubSteps.requestAuthorizationIfNeeded() }
                     HubNotifications.refresh(state: state)
                 }
 
