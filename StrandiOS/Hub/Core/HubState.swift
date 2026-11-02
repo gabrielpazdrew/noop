@@ -31,6 +31,9 @@ final class HubState {
         static let failureArmedFor = "hub.notice.failureArmedFor"
         static let lockedAlerted = "hub.notice.lockedAlerted"
         static let tripwireAlerted = "hub.notice.tripwireAlerted"
+        static let bandLostArmedFor = "hub.notice.bandLostArmedFor"
+        static let lastGoodLinkAt = "hub.link.lastGoodLinkAt"
+        static let lastSyncSeen = "hub.link.lastSyncSeen"
     }
 
     let defaults: UserDefaults
@@ -140,13 +143,24 @@ final class HubState {
             HubNoticeMemory(renewalArmedFor: date(Key.renewalArmedFor),
                             failureArmedFor: date(Key.failureArmedFor),
                             lockedAlerted: defaults.bool(forKey: Key.lockedAlerted),
-                            tripwireAlerted: defaults.bool(forKey: Key.tripwireAlerted))
+                            tripwireAlerted: defaults.bool(forKey: Key.tripwireAlerted),
+                            bandLostArmedFor: date(Key.bandLostArmedFor))
         }
         set {
             setDate(newValue.renewalArmedFor, Key.renewalArmedFor)
             setDate(newValue.failureArmedFor, Key.failureArmedFor)
             defaults.set(newValue.lockedAlerted, forKey: Key.lockedAlerted)
             defaults.set(newValue.tripwireAlerted, forKey: Key.tripwireAlerted)
+            setDate(newValue.bandLostArmedFor, Key.bandLostArmedFor)
+        }
+    }
+
+    /// HubLinkTracker's persisted half (the band-lost clock), kept across relaunches.
+    var linkMemory: HubLinkMemory {
+        get { HubLinkMemory(lastGoodLinkAt: date(Key.lastGoodLinkAt), lastSyncSeen: date(Key.lastSyncSeen)) }
+        set {
+            setDate(newValue.lastGoodLinkAt, Key.lastGoodLinkAt)
+            setDate(newValue.lastSyncSeen, Key.lastSyncSeen)
         }
     }
 

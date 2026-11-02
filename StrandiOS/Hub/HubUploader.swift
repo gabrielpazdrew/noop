@@ -41,6 +41,8 @@ enum HubUploader {
     private(set) static var lastPendingSyncEndedAt: Int?
     private static var backfillingWatch: AnyCancellable?
     private static var pendingSyncWatch: AnyCancellable?
+    private static var connectedWatch: AnyCancellable?
+    private static var lastSyncWatch: AnyCancellable?
 
     static func watchBackfilling() {
         guard backfillingWatch == nil, let live = AppModel.shared?.live else { return }
@@ -49,6 +51,21 @@ enum HubUploader {
         }
         pendingSyncWatch = live.$historyPendingSync.removeDuplicates().dropFirst().sink { on in
             if !on { HubUploader.lastPendingSyncEndedAt = Int(Date().timeIntervalSince1970) }
+        }
+        // Band link (PLAN-BAND-LINK T3): every connect, drop and sync re-plans the "band lost" notice. One
+        // more refresh just past HubLinkTracker.goodAfter lets a quiet but steady connection count as good.
+        // (@Published fires in willSet; refresh() hops through the notification settings first, so it
+        // reads the new value.)
+        connectedWatch = live.$connected.removeDuplicates().dropFirst().sink { on in
+            HubNotifications.refresh()
+            if on {
+                DispatchQueue.main.asyncAfter(deadline: .now() + HubLinkTracker.goodAfter + 1) {
+                    HubNotifications.refresh()
+                }
+            }
+        }
+        lastSyncWatch = live.$lastSyncedAt.removeDuplicates().dropFirst().sink { _ in
+            HubNotifications.refresh()
         }
     }
 

@@ -5,9 +5,9 @@
 // state and hands the result to UNUserNotificationCenter.
 import Foundation
 
-/// The four hub notifications. One stable request id per kind, so re-planning replaces, never stacks.
+/// The five hub notifications. One stable request id per kind, so re-planning replaces, never stacks.
 enum HubNoticeKind: String, CaseIterable {
-    case renewal, uploadsFailing, hubLocked, tripwire
+    case renewal, uploadsFailing, hubLocked, tripwire, bandLost
     var identifier: String { "hub.notice.\(rawValue)" }
 }
 
@@ -33,6 +33,8 @@ struct HubNoticeMemory: Equatable {
     var failureArmedFor: Date? = nil
     var lockedAlerted: Bool = false
     var tripwireAlerted: Bool = false
+    /// The `bandLostSince` the "band lost" notice was armed for.
+    var bandLostArmedFor: Date? = nil
 }
 
 struct HubNoticeInputs {
@@ -48,11 +50,15 @@ struct HubNoticeInputs {
     let failingSince: Date?
     let locked: Bool
     let tripwire: Bool
+    /// When the phone last had a working link to the band (HubLinkTracker); nil while the link is good
+    /// or none was ever seen. Defaulted so callers that predate it plan no band notice.
+    var bandLostSince: Date? = nil
 }
 
 enum HubNoticePlanner {
     static let renewalLead: TimeInterval = 3 * 86_400
     static let failureGrace: TimeInterval = 6 * 3_600
+    static let bandLostGrace: TimeInterval = 30 * 60
 
     /// The later of the two dates (either may be missing). The server learns of a refresh only
     /// after the phone tells it, and the embedded profile only changes on a re-sign, so whichever
@@ -103,6 +109,22 @@ enum HubNoticePlanner {
             m.failureArmedFor = nil
         }
 
+        // Band lost: same shape as uploads failing, 30 min after the last good link. Scheduled ahead, so
+        // it fires even when nothing wakes the app; a good link clears bandLostSince and cancels it.
+        if i.enabled, let since = i.bandLostSince {
+            let due = since.addingTimeInterval(bandLostGrace)
+            if due > i.now {
+                actions.append(.schedule(notice(.bandLost, fireAt: due, renewalEstimate: nil)))
+                m.bandLostArmedFor = since
+            } else if m.bandLostArmedFor != since {
+                actions.append(.schedule(notice(.bandLost, fireAt: i.now, renewalEstimate: nil)))
+                m.bandLostArmedFor = since
+            }
+        } else if m.bandLostArmedFor != nil {
+            actions.append(.cancel(.bandLost))
+            m.bandLostArmedFor = nil
+        }
+
         // Locked and tripwire: once per false → true transition.
         // (Each kind is cancelled only when it was armed, so a quiet state yields an empty plan.)
         if i.enabled && i.locked {
@@ -146,6 +168,10 @@ enum HubNoticePlanner {
         case .tripwire:
             return HubNotice(kind: kind, title: "Hub tripwire",
                              body: "Something called your hub's decoy. Check the hub's security alerts.",
+                             fireAt: fireAt)
+        case .bandLost:
+            return HubNotice(kind: kind, title: "Band not syncing",
+                             body: "NOOP hasn't had a working link to your band for 30 minutes. Keep the phone near the band and open NOOP. Don't Forget the band in Bluetooth settings.",
                              fireAt: fireAt)
         }
     }

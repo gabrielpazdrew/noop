@@ -25,10 +25,11 @@ final class HubNoticePlannerTests: XCTestCase {
     let day: TimeInterval = 86_400
 
     func inputs(now: Date, enabled: Bool = true, server: Date? = nil, embedded: Date? = nil,
-                failingSince: Date? = nil, locked: Bool = false, tripwire: Bool = false) -> HubNoticeInputs {
+                failingSince: Date? = nil, locked: Bool = false, tripwire: Bool = false,
+                bandLostSince: Date? = nil) -> HubNoticeInputs {
         HubNoticeInputs(now: now, enabled: enabled, serverRenewalEstimate: server,
                         embeddedExpiry: embedded, failingSince: failingSince,
-                        locked: locked, tripwire: tripwire)
+                        locked: locked, tripwire: tripwire, bandLostSince: bandLostSince)
     }
 
     /// Plan + apply one step, like HubNotifications.refresh does on the phone.
@@ -200,10 +201,64 @@ final class HubNoticePlannerTests: XCTestCase {
         XCTAssertTrue(sent.lockedAlerted && sent.tripwireAlerted)
     }
 
+    // MARK: band lost (PLAN-BAND-LINK T3)
+
+    func testBandLostScheduledThirtyMinutesAfterTheLastGoodLink() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        for minutes in [0.0, 5, 29] {
+            step(inputs(now: t0.addingTimeInterval(minutes * 60), bandLostSince: t0), &memory, center)
+            XCTAssertEqual(center.count(.bandLost), 1)
+            XCTAssertEqual(center.fireAt(.bandLost), t0.addingTimeInterval(30 * 60))
+        }
+        XCTAssertEqual(memory.bandLostArmedFor, t0)
+    }
+
+    func testBandLostFiresOnceWhenAlreadyOverdueThenStaysQuiet() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        let a = step(inputs(now: t0.addingTimeInterval(2 * hour), bandLostSince: t0), &memory, center)
+        XCTAssertEqual(a.count, 1)
+        XCTAssertEqual(a, [.schedule(HubNoticePlanner.notice(.bandLost, fireAt: t0.addingTimeInterval(2 * hour),
+                                                              renewalEstimate: nil))])
+        XCTAssertEqual(center.count(.bandLost), 1)
+        center.pending.removeAll() // delivered
+        let b = step(inputs(now: t0.addingTimeInterval(3 * hour), bandLostSince: t0), &memory, center)
+        XCTAssertTrue(b.isEmpty)
+        XCTAssertEqual(center.count(.bandLost), 0)
+    }
+
+    func testGoodLinkCancelsBandLostAndANewLossArmsAgain() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        step(inputs(now: t0.addingTimeInterval(10 * 60), bandLostSince: t0), &memory, center)
+        step(inputs(now: t0.addingTimeInterval(20 * 60), bandLostSince: nil), &memory, center)
+        XCTAssertEqual(center.count(.bandLost), 0)
+        XCTAssertNil(memory.bandLostArmedFor)
+        let later = t0.addingTimeInterval(hour)
+        step(inputs(now: later, bandLostSince: later), &memory, center)
+        XCTAssertEqual(center.fireAt(.bandLost), later.addingTimeInterval(30 * 60))
+    }
+
+    func testDisabledHubCancelsBandLost() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        step(inputs(now: t0, bandLostSince: t0), &memory, center)
+        step(inputs(now: t0.addingTimeInterval(60), enabled: false, bandLostSince: t0), &memory, center)
+        XCTAssertEqual(center.count(.bandLost), 0)
+        XCTAssertNil(memory.bandLostArmedFor)
+        let quiet = step(inputs(now: t0.addingTimeInterval(120), enabled: false, bandLostSince: t0), &memory, center)
+        XCTAssertTrue(quiet.isEmpty)
+    }
+
+    func testBandLostDefaultsToNilSoExistingCallersPlanNothing() {
+        let i = HubNoticeInputs(now: t0, enabled: true, serverRenewalEstimate: nil, embeddedExpiry: nil,
+                                failingSince: nil, locked: false, tripwire: false)
+        XCTAssertNil(i.bandLostSince)
+        XCTAssertTrue(HubNoticePlanner.plan(i, memory: HubNoticeMemory()).actions.isEmpty)
+    }
+
     func testIdentifiersAreStableAndDistinct() {
         let ids = HubNoticeKind.allCases.map(\.identifier)
         XCTAssertEqual(ids, ["hub.notice.renewal", "hub.notice.uploadsFailing",
-                             "hub.notice.hubLocked", "hub.notice.tripwire"])
+                             "hub.notice.hubLocked", "hub.notice.tripwire",
+                             "hub.notice.bandLost"])
         XCTAssertEqual(Set(ids).count, ids.count)
     }
 

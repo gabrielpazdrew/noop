@@ -28,6 +28,25 @@ final class HubStateTests: XCTestCase {
         XCTAssertFalse(s.locked)
         XCTAssertEqual(s.openAlerts, 0)
         XCTAssertEqual(s.noticeMemory, HubNoticeMemory())
+        XCTAssertEqual(s.linkMemory, HubLinkMemory())
+    }
+
+    func testLinkMemoryAndBandLostArmPersistAcrossInstances() {
+        let a = HubState(defaults: defaults)
+        a.linkMemory = HubLinkMemory(lastGoodLinkAt: Date(timeIntervalSince1970: 1_793_000_000),
+                                     lastSyncSeen: Date(timeIntervalSince1970: 1_792_999_000))
+        var m = HubNoticeMemory()
+        m.bandLostArmedFor = Date(timeIntervalSince1970: 1_793_000_100)
+        a.noticeMemory = m
+        let b = HubState(defaults: defaults)
+        XCTAssertEqual(b.linkMemory, a.linkMemory)
+        XCTAssertEqual(b.noticeMemory.bandLostArmedFor, Date(timeIntervalSince1970: 1_793_000_100))
+        XCTAssertNotNil(defaults.object(forKey: "hub.link.lastGoodLinkAt"))
+        XCTAssertNotNil(defaults.object(forKey: "hub.link.lastSyncSeen"))
+        XCTAssertNotNil(defaults.object(forKey: "hub.notice.bandLostArmedFor"))
+        b.linkMemory = HubLinkMemory()
+        XCTAssertNil(defaults.object(forKey: "hub.link.lastGoodLinkAt"))
+        XCTAssertEqual(HubState(defaults: defaults).linkMemory, HubLinkMemory())
     }
 
     func testFailureStreakStartsOnceAndSuccessClearsIt() {

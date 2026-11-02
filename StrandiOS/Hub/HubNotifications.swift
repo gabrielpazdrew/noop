@@ -29,7 +29,8 @@ final class UserNotificationHubCenter: HubNoticeCenter {
 enum HubNotifications {
     /// Re-plan every hub notification from the current state. Called after each upload attempt
     /// (HubUploader), when the app comes to the foreground (HubUploader.sceneBecameActive), when
-    /// Settings change, and once the notification prompt is answered. Cheap and idempotent; callable
+    /// Settings change, once the notification prompt is answered, and on every band connect, drop and
+    /// strap sync (HubUploader.watchBackfilling). Cheap and idempotent; callable
     /// from any thread.
     ///
     /// Plan + apply + save run on the main actor, one refresh at a time, so two callers can never both
@@ -50,15 +51,26 @@ enum HubNotifications {
         }
     }
 
+    /// The current connection's half of the band-link clock (in memory; HubState keeps the rest).
+    @MainActor private static var linkTracker = HubLinkTracker()
+
     @MainActor
     private static func apply(state: HubState, now: Date, canNotify: Bool, center: HubNoticeCenter) {
+        // Band link first (PLAN-BAND-LINK T3): tracked even while the hub is off or notifications are
+        // denied, so the clock is right the moment either changes. No AppModel yet = no new observation.
+        if let live = AppModel.shared?.live {
+            state.linkMemory = linkTracker.observe(connected: live.connected,
+                                                   lastSyncedAt: live.lastSyncedAt.map { Date(timeIntervalSince1970: $0) },
+                                                   now: now, memory: state.linkMemory)
+        }
         let inputs = HubNoticeInputs(now: now,
                                      enabled: state.enabled,
                                      serverRenewalEstimate: state.serverRenewalEstimate,
                                      embeddedExpiry: SigningInfo.embeddedExpirationDate(),
                                      failingSince: state.failingSince,
                                      locked: state.locked,
-                                     tripwire: state.tripwire)
+                                     tripwire: state.tripwire,
+                                     bandLostSince: linkTracker.lostSince(memory: state.linkMemory))
         state.noticeMemory = HubNoticeRefresher.refresh(inputs, memory: state.noticeMemory,
                                                         canNotify: canNotify, center: center)
     }
