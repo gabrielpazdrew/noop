@@ -26,10 +26,11 @@ final class HubNoticePlannerTests: XCTestCase {
 
     func inputs(now: Date, enabled: Bool = true, server: Date? = nil, embedded: Date? = nil,
                 failingSince: Date? = nil, locked: Bool = false, tripwire: Bool = false,
-                bandLostSince: Date? = nil) -> HubNoticeInputs {
+                bandLostSince: Date? = nil, launchedAt: Date? = nil) -> HubNoticeInputs {
         HubNoticeInputs(now: now, enabled: enabled, serverRenewalEstimate: server,
                         embeddedExpiry: embedded, failingSince: failingSince,
-                        locked: locked, tripwire: tripwire, bandLostSince: bandLostSince)
+                        locked: locked, tripwire: tripwire, bandLostSince: bandLostSince,
+                        launchedAt: launchedAt)
     }
 
     /// Plan + apply one step, like HubNotifications.refresh does on the phone.
@@ -245,6 +246,55 @@ final class HubNoticePlannerTests: XCTestCase {
         XCTAssertNil(memory.bandLostArmedFor)
         let quiet = step(inputs(now: t0.addingTimeInterval(120), enabled: false, bandLostSince: t0), &memory, center)
         XCTAssertTrue(quiet.isEmpty)
+    }
+
+    func testColdLaunchDefersAnOverdueBandLostUntilTheLinkHadTimeToProveItself() {
+        // Relaunched 2 h after the last good link: posting at once would be a false alarm if the band is
+        // right there and the link is about to prove itself. Deferred to launch + settle instead.
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        let launch = t0.addingTimeInterval(2 * hour)
+        let settle = launch.addingTimeInterval(HubNoticePlanner.launchSettle)
+        step(inputs(now: launch, bandLostSince: t0, launchedAt: launch), &memory, center)
+        XCTAssertEqual(center.fireAt(.bandLost), settle)
+        step(inputs(now: launch.addingTimeInterval(60), bandLostSince: t0, launchedAt: launch), &memory, center)
+        XCTAssertEqual(center.count(.bandLost), 1)
+        XCTAssertEqual(center.fireAt(.bandLost), settle)
+        // The link proves good inside the window: cancelled, nothing ever shown.
+        step(inputs(now: launch.addingTimeInterval(130), bandLostSince: nil, launchedAt: launch), &memory, center)
+        XCTAssertEqual(center.count(.bandLost), 0)
+        XCTAssertNil(memory.bandLostArmedFor)
+    }
+
+    func testColdLaunchDeferralAlsoCoversANoticeDueInsideTheWindow() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        let launch = t0.addingTimeInterval(29 * 60) // due 60 s after launch
+        step(inputs(now: launch, bandLostSince: t0, launchedAt: launch), &memory, center)
+        XCTAssertEqual(center.fireAt(.bandLost), launch.addingTimeInterval(HubNoticePlanner.launchSettle))
+    }
+
+    func testAfterTheSettleWindowAnOverdueBandLostPostsAtOnceAndOnlyOnce() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        let launch = t0.addingTimeInterval(hour)
+        let now = launch.addingTimeInterval(HubNoticePlanner.launchSettle + 1)
+        let a = step(inputs(now: now, bandLostSince: t0, launchedAt: launch), &memory, center)
+        XCTAssertEqual(a, [.schedule(HubNoticePlanner.notice(.bandLost, fireAt: now, renewalEstimate: nil))])
+        center.pending.removeAll()
+        XCTAssertTrue(step(inputs(now: now.addingTimeInterval(60), bandLostSince: t0, launchedAt: launch),
+                           &memory, center).isEmpty)
+    }
+
+    func testSettleWindowLeavesOtherKindsAlone() {
+        var memory = HubNoticeMemory(), center = FakeNoticeCenter(now: t0)
+        step(inputs(now: t0.addingTimeInterval(7 * hour), failingSince: t0, launchedAt: t0.addingTimeInterval(7 * hour)),
+             &memory, center)
+        XCTAssertEqual(center.count(.uploadsFailing), 1)
+        XCTAssertLessThanOrEqual(center.fireAt(.uploadsFailing)!, t0.addingTimeInterval(7 * hour + 1))
+    }
+
+    func testBandLostTextCarriesTheRecoveryStep() {
+        let n = HubNoticePlanner.notice(.bandLost, fireAt: t0, renewalEstimate: nil)
+        XCTAssertEqual(n.title, "Band not syncing")
+        XCTAssertEqual(n.body, "NOOP hasn't had a working link to your band for 30 minutes. Keep the phone near the band and open NOOP. If it won't connect, tap the band until it flashes blue, then Scan & Connect. Never Forget the band in Bluetooth settings.")
     }
 
     func testBandLostDefaultsToNilSoExistingCallersPlanNothing() {

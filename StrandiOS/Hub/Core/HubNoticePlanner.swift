@@ -53,12 +53,18 @@ struct HubNoticeInputs {
     /// When the phone last had a working link to the band (HubLinkTracker); nil while the link is good
     /// or none was ever seen. Defaulted so callers that predate it plan no band notice.
     var bandLostSince: Date? = nil
+    /// When this process launched (HubNotifications.appLaunched); nil = unknown. A band-lost notice that is
+    /// already overdue is held until `launchSettle` after it, so a cold launch next to a working band
+    /// never posts before the link has had time to prove itself.
+    var launchedAt: Date? = nil
 }
 
 enum HubNoticePlanner {
     static let renewalLead: TimeInterval = 3 * 86_400
     static let failureGrace: TimeInterval = 6 * 3_600
     static let bandLostGrace: TimeInterval = 30 * 60
+    /// HubLinkTracker.goodAfter plus a minute of slack for the connect itself and the follow-up refresh.
+    static let launchSettle: TimeInterval = HubLinkTracker.goodAfter + 60
 
     /// The later of the two dates (either may be missing). The server learns of a refresh only
     /// after the phone tells it, and the embedded profile only changes on a re-sign, so whichever
@@ -110,9 +116,11 @@ enum HubNoticePlanner {
         }
 
         // Band lost: same shape as uploads failing, 30 min after the last good link. Scheduled ahead, so
-        // it fires even when nothing wakes the app; a good link clears bandLostSince and cancels it.
+        // it fires even when nothing wakes the app; a good link clears bandLostSince and cancels it. Never
+        // earlier than `launchSettle` after a launch: the post-now branch waits out that window.
         if i.enabled, let since = i.bandLostSince {
-            let due = since.addingTimeInterval(bandLostGrace)
+            let settled = i.launchedAt.map { $0.addingTimeInterval(launchSettle) } ?? .distantPast
+            let due = max(since.addingTimeInterval(bandLostGrace), settled)
             if due > i.now {
                 actions.append(.schedule(notice(.bandLost, fireAt: due, renewalEstimate: nil)))
                 m.bandLostArmedFor = since
@@ -171,7 +179,7 @@ enum HubNoticePlanner {
                              fireAt: fireAt)
         case .bandLost:
             return HubNotice(kind: kind, title: "Band not syncing",
-                             body: "NOOP hasn't had a working link to your band for 30 minutes. Keep the phone near the band and open NOOP. Don't Forget the band in Bluetooth settings.",
+                             body: "NOOP hasn't had a working link to your band for 30 minutes. Keep the phone near the band and open NOOP. If it won't connect, tap the band until it flashes blue, then Scan & Connect. Never Forget the band in Bluetooth settings.",
                              fireAt: fireAt)
         }
     }

@@ -96,6 +96,9 @@ struct StrandiOSApp: App {
         // The strap-sync Live Activity (Lock Screen + Dynamic Island). Same placement, same reason — and
         // it must also run in a process the Sync Strap shortcut launched with no scene.
         SyncLiveActivityController.shared.attach(to: model.live)
+        // Fork-only (phone-hub): band-link watchers + notice re-plan on every launch, including a
+        // background Bluetooth restoration launch that never brings up a scene (PLAN-BAND-LINK T3).
+        HubNotifications.appLaunched()
         // iOS's own daily report of NOOP's CPU, memory, disk writes, hangs and exits, and its crash/hang reports,
         // one strap-log line each. Registering is the whole cost; iOS gathers and delivers them (MetricKitLog).
         MetricKitLog.shared.attach(to: model.live)

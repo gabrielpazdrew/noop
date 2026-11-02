@@ -44,6 +44,7 @@ enum HubUploader {
     private static var connectedWatch: AnyCancellable?
     private static var lastSyncWatch: AnyCancellable?
 
+    /// Idempotent: installs the sinks once per process (the guard), whichever hook calls it first.
     static func watchBackfilling() {
         guard backfillingWatch == nil, let live = AppModel.shared?.live else { return }
         backfillingWatch = live.$backfilling.removeDuplicates().dropFirst().sink { on in

@@ -51,6 +51,19 @@ enum HubNotifications {
         }
     }
 
+    /// When this process launched (set by `appLaunched`), for the band-lost launch settle window.
+    @MainActor private(set) static var launchedAt: Date?
+
+    /// Fork hook (StrandiOSApp.init, after AppModel exists): runs on every launch, including a Bluetooth
+    /// state-restoration launch in the background that never reaches a scene, so the band-link watchers
+    /// are installed and the notices re-planned before any upload or foreground.
+    @MainActor
+    static func appLaunched(now: Date = Date()) {
+        if launchedAt == nil { launchedAt = now }
+        HubUploader.watchBackfilling()
+        refresh()
+    }
+
     /// The current connection's half of the band-link clock (in memory; HubState keeps the rest).
     @MainActor private static var linkTracker = HubLinkTracker()
 
@@ -70,7 +83,8 @@ enum HubNotifications {
                                      failingSince: state.failingSince,
                                      locked: state.locked,
                                      tripwire: state.tripwire,
-                                     bandLostSince: linkTracker.lostSince(memory: state.linkMemory))
+                                     bandLostSince: linkTracker.lostSince(memory: state.linkMemory),
+                                     launchedAt: launchedAt)
         state.noticeMemory = HubNoticeRefresher.refresh(inputs, memory: state.noticeMemory,
                                                         canNotify: canNotify, center: center)
     }
