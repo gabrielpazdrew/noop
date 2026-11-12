@@ -508,6 +508,7 @@ struct RootTabView: View {
                     // so it can't compile or apply on iPhone. iPhone's wrist-alert controls live on the
                     // Automations screen instead. Its absence from the iPhone More list is correct.
                     MoreRow("Alarms", "alarm.fill", .alarms)
+                    MoreRow("Wake Alarm", "alarm.waves.left.and.right.fill", .wakeAlarm) // fork-only (phone-hub, wake)
                     MoreRow("Automations", "wand.and.stars", .automations)
                     // The Test Centre (the diagnostics + bug-report hub) gets a first-class home here, not
                     // just buried in Settings, so the feedback loop is one tap from the More tab.
@@ -602,6 +603,7 @@ private enum MoreDestination: Hashable {
     case live, workouts, liftLog, health, labBook, stress, breathe, intervals, rhythm
     case fusedRecord, appleHealth, miBand, dataSources, backupSync, shortcutsExport, noopLimitations
     case healthHub // fork-only (phone-hub)
+    case wakeAlarm // fork-only (phone-hub, wake)
     case alarms, automations, testCentre, siriShortcuts, powerSaving, settings
 
     @ViewBuilder var destination: some View {
@@ -629,6 +631,7 @@ private enum MoreDestination: Hashable {
         case .backupSync:      BackupSyncView()
         case .shortcutsExport: ShortcutExportSettingsView()
         case .healthHub:       HubSettingsView() // fork-only (phone-hub)
+        case .wakeAlarm:       WakeAlarmSettingsView() // fork-only (phone-hub, wake)
         case .alarms:          SmartAlarmView()
         case .automations:     AutomationsView()
         case .testCentre:      TestCentreView()
