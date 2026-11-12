@@ -107,6 +107,28 @@ struct SyncStrapIntent: LiveActivityIntent {
     }
 }
 
+/// Fork-only (phone-hub, wake): PLAN-WAKE-PHONE T5. The one way a wake run starts: meant for the Sleep →
+/// "Waking Up" personal automation. Runs in NOOP's process without opening it, like Sync Strap. Deliberately
+/// NOT in `NOOPShortcuts` below: no Siri phrase and no Spotlight entry, so nothing starts it by voice or by
+/// accident; it still shows in the Shortcuts editor. The runner's gate decides (switch, "Skip tomorrow", one
+/// run at a time).
+struct StartWakeAlarmIntent: AppIntent {
+    static var title: LocalizedStringResource = "Start Wake Alarm"
+    static var description = IntentDescription("Buzz your strap until your heart rate shows you're up. For the Sleep \"Waking Up\" automation.")
+    static var openAppWhenRun = false
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        switch await WakeAlarmRunner.shared.trigger(now: Date()) {
+        case .decided(.start):           return .result(dialog: "Wake alarm started.")
+        case .decided(.skippedOff):      return .result(dialog: "Wake alarm is off.")
+        case .decided(.skippedTomorrow): return .result(dialog: "Skipping this morning.")
+        case .decided(.ignoredLiveRun):  return .result(dialog: "Wake alarm already running.")
+        case .notReady:                  return .result(dialog: "NOOP wasn't ready, so the wake alarm didn't start.")
+        }
+    }
+}
+
 /// K9: Ask the Coach a question via Siri. Queues the question and opens the app, which sends it
 /// to the configured provider and surfaces the response. The question is spoken or typed in Siri;
 /// the app handles the actual network call using the user's saved key.
