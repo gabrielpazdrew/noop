@@ -528,6 +528,9 @@ targets:
     sources:
       - StrandiOSTests/Hub
       - StrandiOS/Hub/Core
+      # Fork-only (phone-hub, wake): the phone wake alarm's pure engine, gate and settings.
+      - StrandiOSTests/WakeAlarm
+      - StrandiOS/WakeAlarm/Core
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
