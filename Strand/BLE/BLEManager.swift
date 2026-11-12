@@ -5653,6 +5653,7 @@ public final class BLEManager: NSObject, ObservableObject {
         collector?.ingestStandardHR(hr: m.hr, rr: rr, contact: m.contact,
                                     family: router.family,
                                     at: Int(Date().timeIntervalSince1970))
+        if readable { BLEManager.wakeHeartRateObserver?(m.hr, now) }   // fork-only (phone-hub, wake)
     }
 }
 
@@ -6710,6 +6711,9 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Confirmed write failed: \(error.localizedDescription)\(BLEManager.bleErrorSuffix(error))")
+            if characteristic.uuid == BLEManager.cmdWriteChar || characteristic.uuid == BLEManager.whoop5CmdWriteChar {
+                BLEManager.wakeWriteErrorObserver?(error.localizedDescription)   // fork-only (phone-hub, wake)
+            }
             // #1635: a failed write owes no ack. Leaving the window open would let the NEXT completion on
             // fd4b0002 — DISABLE_ALARM and every other puffin command share it — satisfy both halves of
             // the bond gate below and declare a bond the strap never granted, which is the whole bug.
@@ -7210,6 +7214,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         guard let data = characteristic.value else { return }
         let bytes = [UInt8](data)
         lastDataAt = Date()   // feed the liveness watchdog on every notification
+        BLEManager.wakeFrameObserver?(lastDataAt)   // fork-only (phone-hub, wake)
         // #1809: count BEFORE the per-characteristic switch below, so the tally covers every inbound
         // frame including ones no branch consumes - the epitaph must answer "did anything arrive at all".
         inboundFrames += 1
@@ -7549,5 +7554,27 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 maybeSignalConnectSettled()
             }
         }
+    }
+}
+
+// MARK: - Wake alarm hooks
+// fork-only (phone-hub, wake): PLAN-WAKE-PHONE T4a. Inert unless StrandiOS/WakeAlarm sets the observers
+// (nothing sets them on macOS). No new payloads or opcodes: wakeBuzz() only calls the existing buzzStrapOnce().
+extension BLEManager {
+    /// Every READABLE standard-HR sample (bpm, arrival time), after parseStandardHR's own handling.
+    static var wakeHeartRateObserver: ((Int, Date) -> Void)?
+    /// Every inbound notification frame (arrival time), where the liveness watchdog is fed.
+    static var wakeFrameObserver: ((Date) -> Void)?
+    /// A confirmed write on the command characteristic failed (error text only, never payload bytes).
+    static var wakeWriteErrorObserver: ((String) -> Void)?
+
+    /// A command would reach the strap AND the link is bonded (an unbonded acked write would just fail).
+    var wakeLinkReady: Bool { commandChannelReady && state.bonded }
+
+    /// One wake buzz via the existing buzzStrapOnce(). Returns false, sending nothing, if the link isn't ready.
+    func wakeBuzz() -> Bool {
+        guard wakeLinkReady else { return false }
+        buzzStrapOnce()
+        return true
     }
 }
