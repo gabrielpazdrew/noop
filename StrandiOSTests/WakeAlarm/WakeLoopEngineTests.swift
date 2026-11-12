@@ -254,6 +254,62 @@ final class WakeLoopEngineTests: XCTestCase {
         XCTAssertEqual(stops(all), [.noHR])
     }
 
+    // MARK: boundaries
+
+    func testCapIsExactlySixHundredSeconds() {
+        var s = run()
+        for t in stride(from: 0, through: 500, by: 100) { step(&s, sample(TimeInterval(t), 55), now: TimeInterval(t)) }
+        step(&s, sample(599, 55), now: 599.5)
+        XCTAssertNil(s.stopReason)
+        XCTAssertEqual(step(&s, .tick, now: 600), [.stop(.timeout)])
+    }
+
+    func testNoHRLimitIsExactlyOneTwentySeconds() {
+        var s = run()
+        XCTAssertFalse(stops(step(&s, .tick, now: 119.5)).contains(.noHR))
+        XCTAssertNil(s.stopReason)
+        XCTAssertEqual(step(&s, .tick, now: 120), [.stop(.noHR)])
+    }
+
+    func testLiveWindowIncludesExactlyThirtyFiveSeconds() {
+        var s = run()
+        step(&s, sample(10, 60), now: 45)          // exactly 35 s old: live
+        XCTAssertEqual(s.lastLiveAt, at(45))
+        XCTAssertEqual(s.maxBpm, 60)
+        step(&s, sample(20, 70), now: 55.5)        // 35.5 s old: walked, not live
+        XCTAssertEqual(s.lastLiveAt, at(45))
+        XCTAssertEqual(s.lastSeenTs, at(20))
+        XCTAssertEqual(s.maxBpm, 60)
+    }
+
+    func testLookBackIncludesExactlySixtyFiveSeconds() {
+        var s = run()
+        step(&s, sample(5, 90), now: 70)           // exactly 65 s old: walked
+        XCTAssertEqual(s.lastSeenTs, at(5))
+        XCTAssertEqual(s.overN, 1)
+        var s2 = run()
+        step(&s2, sample(5, 90), now: 70.5)        // 65.5 s old: ignored
+        XCTAssertEqual(s2.lastSeenTs, at(-31))
+        XCTAssertEqual(s2.overN, 0)
+    }
+
+    // MARK: clock jumps
+
+    func testBackwardClockJumpStopsTheRunAtOnce() {
+        var s = run()
+        feed(&s, from: 0, secs: 10, bpm: 55)
+        let acts = step(&s, sample(-3600, 55), now: -3600)
+        XCTAssertEqual(acts, [.stop(.clockMoved)])
+        XCTAssertEqual(s.stopReason, .clockMoved)
+        XCTAssertEqual(step(&s, .tick, now: -3598), [])
+        XCTAssertEqual(step(&s, .tick, now: 5), [])
+    }
+
+    func testBackwardJumpOnATickStopsToo() {
+        var s = run()
+        XCTAssertEqual(step(&s, .tick, now: -1), [.stop(.clockMoved)])
+    }
+
     // MARK: buzz gate
 
     func testFirstEventBuzzesWhenLinkReady() {
@@ -338,6 +394,19 @@ final class WakeLoopEngineTests: XCTestCase {
         XCTAssertEqual(stops(all), [.buzzFailed])
         XCTAssertEqual(s.consecutiveFailures, 3)
         XCTAssertTrue(all.contains(.log("buzz FAILED (3/3): write error")))
+    }
+
+    func testConfirmedBuzzesCountedSeparatelyFromRequested() {
+        var s = run()
+        let results = [true, false, true]
+        for (k, ok) in results.enumerated() {
+            let t = TimeInterval(k * 2)
+            step(&s, sample(t, 55), now: t)
+            step(&s, .buzzResult(ok: ok, detail: "x"), now: t + 0.5)
+        }
+        step(&s, sample(6, 55), now: 6)              // requested, no result yet
+        XCTAssertEqual(s.buzzCount, 4)
+        XCTAssertEqual(s.confirmedBuzzCount, 2)
     }
 
     func testASuccessInBetweenResetsTheFailureCount() {

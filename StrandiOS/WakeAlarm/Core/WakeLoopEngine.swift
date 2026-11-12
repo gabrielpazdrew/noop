@@ -62,6 +62,8 @@ enum WakeThresholdSource: Equatable {
 
 enum WakeStopReason: String, Codable, Equatable {
     case awake, timeout, noHR, buzzFailed, stopped, interrupted
+    /// The wall clock went back before the run's start: every age and limit is then meaningless.
+    case clockMoved
 }
 
 enum WakeEvent: Equatable {
@@ -96,8 +98,10 @@ struct WakeRunState: Equatable {
     var lastLiveAt: Date
     /// Wall clock of the last buzz decision, buzz OR skip, so neither happens more than once per spacing.
     var lastBuzzAt: Date
-    /// Buzzes emitted (writes handed to the runner).
+    /// Buzzes requested (writes handed to the runner).
     var buzzCount: Int
+    /// Buzzes the runner reported as written OK (`buzzResult(ok: true)`).
+    var confirmedBuzzCount: Int
     var skippedCount: Int
     var consecutiveFailures: Int
     var maxBpm: Int?
@@ -113,7 +117,7 @@ struct WakeRunState: Equatable {
                      lastNewAt: started,
                      lastLiveAt: started,
                      lastBuzzAt: .distantPast,
-                     buzzCount: 0, skippedCount: 0, consecutiveFailures: 0,
+                     buzzCount: 0, confirmedBuzzCount: 0, skippedCount: 0, consecutiveFailures: 0,
                      maxBpm: warmup.map(\.bpm).max(),
                      stopReason: nil)
     }
@@ -172,7 +176,11 @@ enum WakeLoopEngine {
         // 1. A stopped run stays stopped: no action of any kind, ever.
         guard state.stopReason == nil else { return [] }
 
-        // 2. The clock first, on every event.
+        // 2. The clock first, on every event. A clock that went back before the start stops the run:
+        //    otherwise the cap and every age would be measured from the wrong side.
+        if now < state.started {
+            return stop(&state, reason: .clockMoved)
+        }
         if now.timeIntervalSince(state.started) >= config.cap {
             return stop(&state, reason: .timeout)
         }
@@ -186,6 +194,7 @@ enum WakeLoopEngine {
         case .buzzResult(let ok, let detail):
             // 5. Only the failure count; a result never itself leads to a buzz.
             if ok {
+                state.confirmedBuzzCount += 1
                 state.consecutiveFailures = 0
                 return []
             }

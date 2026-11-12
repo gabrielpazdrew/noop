@@ -10,7 +10,10 @@ struct WakeRunRecord: Codable, Equatable {
     var stopReason: WakeStopReason
     /// `WakeThresholdSource.logDescription`.
     var thresholdSource: String
+    /// Buzzes requested.
     var buzzCount: Int
+    /// Buzzes reported as written OK.
+    var confirmedBuzzCount: Int
     var skippedCount: Int
     var maxBpm: Int?
 }
@@ -27,11 +30,17 @@ final class WakeRunLog {
 
     init(defaults: UserDefaults) { self.defaults = defaults }
 
-    /// Oldest first; empty when nothing was stored or the stored value can't be read.
+    /// Oldest first; empty when nothing was stored or the stored value can't be read. A single
+    /// record that won't decode is skipped, not the whole history.
     var records: [WakeRunRecord] {
         guard let data = defaults.data(forKey: Key.runs),
-              let list = try? JSONDecoder().decode([WakeRunRecord].self, from: data) else { return [] }
-        return list
+              let list = try? JSONDecoder().decode([Lenient].self, from: data) else { return [] }
+        return list.compactMap(\.record)
+    }
+
+    private struct Lenient: Decodable {
+        let record: WakeRunRecord?
+        init(from decoder: Decoder) throws { record = try? WakeRunRecord(from: decoder) }
     }
 
     /// Appends one record, keeping the newest `keep`.

@@ -65,6 +65,27 @@ final class WakeAlarmSettingsTests: XCTestCase {
         XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: date(2026, 12, 31, 21), calendar: cal), "2027-01-01")
     }
 
+    func testSkipTargetAcrossDaylightSavingInLosAngeles() {
+        var la = Calendar(identifier: .gregorian)
+        la.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        func local(_ mo: Int, _ d: Int, _ h: Int, _ mi: Int) -> Date {
+            la.date(from: DateComponents(year: 2026, month: mo, day: d, hour: h, minute: mi))!
+        }
+        // Spring forward, 2026-03-08: 2:00 am jumps to 3:00 am.
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: local(3, 8, 3, 30), calendar: la), "2026-03-08")
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: local(3, 8, 4, 0), calendar: la), "2026-03-09")
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: local(3, 7, 22, 0), calendar: la), "2026-03-08")
+        // Fall back, 2026-11-01: 1:00–2:00 am happens twice (08:00–09:00 and 09:00–10:00 UTC).
+        let firstOneThirty = Date(timeIntervalSince1970: 1_793_521_800)    // 2026-11-01 08:30 UTC = 1:30 am PDT
+        let secondOneThirty = firstOneThirty.addingTimeInterval(3600)       // 1:30 am PST
+        XCTAssertEqual(la.component(.hour, from: firstOneThirty), 1)
+        XCTAssertEqual(la.component(.hour, from: secondOneThirty), 1)
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: firstOneThirty, calendar: la), "2026-11-01")
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: secondOneThirty, calendar: la), "2026-11-01")
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: local(11, 1, 4, 0), calendar: la), "2026-11-02")
+        XCTAssertEqual(WakeAlarmSettings.skipTargetDay(now: local(10, 31, 22, 0), calendar: la), "2026-11-01")
+    }
+
     func testSkipClearsItselfTheDayAfterAndNotBefore() {
         var s = WakeAlarmSettings(defaults: defaults)
         s.skipDay = "2026-03-11"
@@ -91,7 +112,7 @@ final class WakeAlarmSettingsTests: XCTestCase {
         WakeRunRecord(started: Date(timeIntervalSince1970: 1_700_000_000 + Double(k) * 86_400),
                       ended: Date(timeIntervalSince1970: 1_700_000_300 + Double(k) * 86_400),
                       stopReason: .awake, thresholdSource: "fallback",
-                      buzzCount: k, skippedCount: 1, maxBpm: k % 2 == 0 ? nil : 80)
+                      buzzCount: k, confirmedBuzzCount: k / 2, skippedCount: 1, maxBpm: k % 2 == 0 ? nil : 80)
     }
 
     func testRecordRoundTrip() throws {
@@ -99,7 +120,7 @@ final class WakeAlarmSettingsTests: XCTestCase {
         let r = WakeRunRecord(started: Date(timeIntervalSince1970: 1_700_000_000),
                               ended: Date(timeIntervalSince1970: 1_700_000_123),
                               stopReason: .buzzFailed, thresholdSource: "median_last_20min=60(n=40) capped",
-                              buzzCount: 7, skippedCount: 2, maxBpm: 88)
+                              buzzCount: 7, confirmedBuzzCount: 5, skippedCount: 2, maxBpm: 88)
         log.append(r)
         let again = WakeRunLog(defaults: defaults).records
         XCTAssertEqual(again, [r])
@@ -121,6 +142,20 @@ final class WakeAlarmSettingsTests: XCTestCase {
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [])
         defaults.set(Data("not json".utf8), forKey: "wake.runs")
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [])
+    }
+
+    func testOneUndecodableRecordDoesNotDropTheHistory() throws {
+        let log = WakeRunLog(defaults: defaults)
+        log.append(record(1))
+        log.append(record(3))
+        let data = try XCTUnwrap(defaults.data(forKey: "wake.runs"))
+        var list = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [Any])
+        list.insert(["started": "garbage"], at: 1)
+        list.append(42)
+        defaults.set(try JSONSerialization.data(withJSONObject: list), forKey: "wake.runs")
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [record(1), record(3)])
+        log.append(record(5))
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [record(1), record(3), record(5)])
     }
 
     func testActiveRunMarkerPersistsAndClears() {

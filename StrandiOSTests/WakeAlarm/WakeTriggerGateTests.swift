@@ -85,4 +85,12 @@ final class WakeTriggerGateTests: XCTestCase {
         XCTAssertEqual(decide(s, live: morning.addingTimeInterval(-(cap + 60))), .start)
         XCTAssertEqual(decide(s, live: morning.addingTimeInterval(-86_400)), .start)
     }
+
+    func testFutureMarkerCountsOnlyWithinCapPlusSixty() {
+        let s = WakeAlarmSettings(defaults: defaults)
+        XCTAssertEqual(decide(s, live: morning.addingTimeInterval(5)), .ignoredLiveRun)
+        XCTAssertEqual(decide(s, live: morning.addingTimeInterval(cap + 59)), .ignoredLiveRun)
+        XCTAssertEqual(decide(s, live: morning.addingTimeInterval(cap + 60)), .start)
+        XCTAssertEqual(decide(s, live: morning.addingTimeInterval(3 * 86_400)), .start)
+    }
 }
