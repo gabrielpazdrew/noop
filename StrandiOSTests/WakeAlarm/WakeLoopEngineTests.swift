@@ -310,6 +310,29 @@ final class WakeLoopEngineTests: XCTestCase {
         XCTAssertEqual(step(&s, .tick, now: -1), [.stop(.clockMoved)])
     }
 
+    func testBackwardStepMidRunPastToleranceStops() {
+        var s = run()
+        feed(&s, from: 0, secs: 300, bpm: 55)
+        // Back 200 s: still after the start, but the run would otherwise get 200 s more than 10 minutes.
+        XCTAssertEqual(step(&s, .tick, now: 99), [.stop(.clockMoved)])
+        XCTAssertEqual(s.stopReason, .clockMoved)
+    }
+
+    func testBackwardStepWithinToleranceIsTolerated() {
+        var s = run()
+        feed(&s, from: 0, secs: 20, bpm: 55)
+        XCTAssertEqual(stops(step(&s, .tick, now: 14)), [], "5 s back is a stamping jitter, not a clock change")
+        XCTAssertNil(s.stopReason)
+        XCTAssertEqual(stops(step(&s, .tick, now: 13.9)), [.clockMoved], "more than 5 s behind the newest now")
+    }
+
+    func testToleranceMeasuredFromNewestNowNotLast() {
+        var s = run()
+        feed(&s, from: 0, secs: 30, bpm: 55)            // newest now = 29
+        _ = step(&s, .tick, now: 26)                    // 3 s back: tolerated
+        XCTAssertEqual(stops(step(&s, .tick, now: 23.5)), [.clockMoved], "5.5 s behind 29, though only 2.5 s behind 26")
+    }
+
     // MARK: buzz gate
 
     func testFirstEventBuzzesWhenLinkReady() {

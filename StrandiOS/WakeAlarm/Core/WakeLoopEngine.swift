@@ -34,6 +34,9 @@ struct WakeConfig: Equatable {
     var maxBuzzFailures: Int = 3
     /// At most one buzz decision (buzz or skip) per this many seconds.
     var buzzSpacing: TimeInterval = 2
+    /// A step whose clock is more than this behind the newest clock seen in the run stops it (`clockMoved`):
+    /// a clock set back mid-run would otherwise stretch the 10-minute cap in real time.
+    var clockBackTolerance: TimeInterval = 5
 }
 
 struct WakeSample: Equatable {
@@ -98,6 +101,8 @@ struct WakeRunState: Equatable {
     var lastLiveAt: Date
     /// Wall clock of the last buzz decision, buzz OR skip, so neither happens more than once per spacing.
     var lastBuzzAt: Date
+    /// The newest wall clock any step of this run has seen (the backwards-step check reads it).
+    var newestNow: Date
     /// Buzzes requested (writes handed to the runner).
     var buzzCount: Int
     /// Buzzes the runner reported as written OK (`buzzResult(ok: true)`).
@@ -117,6 +122,7 @@ struct WakeRunState: Equatable {
                      lastNewAt: started,
                      lastLiveAt: started,
                      lastBuzzAt: .distantPast,
+                     newestNow: started,
                      buzzCount: 0, confirmedBuzzCount: 0, skippedCount: 0, consecutiveFailures: 0,
                      maxBpm: warmup.map(\.bpm).max(),
                      stopReason: nil)
@@ -178,9 +184,11 @@ enum WakeLoopEngine {
 
         // 2. The clock first, on every event. A clock that went back before the start stops the run:
         //    otherwise the cap and every age would be measured from the wrong side.
-        if now < state.started {
+        //    So does a step more than the tolerance behind the newest clock seen (set back mid-run).
+        if now < state.started || state.newestNow.timeIntervalSince(now) > config.clockBackTolerance {
             return stop(&state, reason: .clockMoved)
         }
+        if now > state.newestNow { state.newestNow = now }
         if now.timeIntervalSince(state.started) >= config.cap {
             return stop(&state, reason: .timeout)
         }

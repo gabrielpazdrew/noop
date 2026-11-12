@@ -38,5 +38,7 @@ final class WakeLogTextTests: XCTestCase {
         XCTAssertEqual(WakeLogText.skippedTomorrow(day: "2026-03-13", calendar: cal),
                        "Wake: skipped (skip tomorrow, Fri Mar 13)")
         XCTAssertEqual(WakeLogText.shortDay("garbage", calendar: cal), "garbage")
+        XCTAssertTrue(WakeLogText.interruptedHapticsCleared.hasPrefix("Wake: "))
+        XCTAssertTrue(WakeLogText.interrupted.hasPrefix("Wake: stop interrupted"))
     }
 }

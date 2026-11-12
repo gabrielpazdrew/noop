@@ -32,6 +32,8 @@ enum WakeLogText {
 
     /// Previous process left a run marker: recorded as interrupted, never resumed.
     static let interrupted = "Wake: stop interrupted (app relaunched; the earlier run is not resumed)"
+    /// The one best-effort stop sent after an interrupted run, once the link was ready.
+    static let interruptedHapticsCleared = "Wake: sent stop-haptics after the interrupted run"
 
     /// `yyyy-MM-dd` → "Fri Nov 14" (English, the calendar's time zone); the raw string if it won't parse.
     static func shortDay(_ day: String, calendar: Calendar) -> String {

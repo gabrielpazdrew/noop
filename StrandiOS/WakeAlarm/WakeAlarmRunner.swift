@@ -36,6 +36,9 @@ final class WakeAlarmRunner {
     /// A trigger is between the gate and the run start (it awaits the model): a second trigger is ignored.
     private var starting = false
     private var launched = false
+    /// A relaunch found a run marker: the killed process may have left a pattern running on the band.
+    /// One best-effort STOP_HAPTICS once the link is ready (never a buzz), then this clears.
+    private var interruptedClearPending = false
 
     private init() {}
 
@@ -62,6 +65,8 @@ final class WakeAlarmRunner {
                                      skippedCount: 0, maxBpm: nil))
             log.activeRunStartedAt = nil
             strapLog(WakeLogText.interrupted)
+            interruptedClearPending = true
+            installRunObservers()   // frames reach clearInterruptedHapticsIfReady(); cleared after the attempt
         }
         var s = settings
         s.clearSkipIfPassed(now: now, calendar: .current)
@@ -94,12 +99,7 @@ final class WakeAlarmRunner {
         if decision != .start {
             // Log the skip if the model is (or soon is) there; a skip never waits on anything else.
             _ = await waitForModel(until: now.addingTimeInterval(Self.modelWaitSeconds))
-            switch decision {
-            case .ignoredLiveRun:  strapLog(WakeLogText.ignoredLiveRun)
-            case .skippedOff:      strapLog(WakeLogText.skippedOff)
-            case .skippedTomorrow: strapLog(WakeLogText.skippedTomorrow(day: s.skipDay ?? "?", calendar: .current))
-            case .start:           break
-            }
+            logRefusal(decision, settings: s)
             return .decided(decision)
         }
 
@@ -123,6 +123,15 @@ final class WakeAlarmRunner {
         }
 
         let started = Date()
+        // The waits above can take up to 8 s: the switch turned off or a skip set meanwhile still refuses.
+        var again = settings
+        again.clearSkipIfPassed(now: started, calendar: .current)
+        let recheck = WakeTriggerGate.decide(settings: again, activeRunStartedAt: runLog.activeRunStartedAt,
+                                             now: started, cap: config.cap)
+        if recheck != .start {
+            logRefusal(recheck, settings: again)
+            return .decided(recheck)
+        }
         let recent = WakeSampleRing.mergeRecent(ring: ring.samples, stored: stored, now: started,
                                                 window: config.medianWindow)
         let (threshold, source) = WakeLoopEngine.pickThreshold(restingHR: resting, recent: recent, config: config)
@@ -143,6 +152,15 @@ final class WakeAlarmRunner {
         return .decided(.start)
     }
 
+    private func logRefusal(_ decision: WakeTriggerDecision, settings s: WakeAlarmSettings) {
+        switch decision {
+        case .ignoredLiveRun:  strapLog(WakeLogText.ignoredLiveRun)
+        case .skippedOff:      strapLog(WakeLogText.skippedOff)
+        case .skippedTomorrow: strapLog(WakeLogText.skippedTomorrow(day: s.skipDay ?? "?", calendar: .current))
+        case .start:           break
+        }
+    }
+
     private func waitForModel(until deadline: Date) async -> AppModel? {
         while AppModel.shared == nil && Date() < deadline {
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -156,12 +174,14 @@ final class WakeAlarmRunner {
     func heartRate(bpm: Int, at: Date) {
         let sample = WakeSample(ts: at, bpm: bpm)
         ring.append(sample)
+        clearInterruptedHapticsIfReady()
         guard run != nil else { return }
         drive(.sample(sample), now: Date())
     }
 
     /// Any other app wake-up (an inbound Bluetooth frame). No-op with no live run.
     func wake(now: Date = Date()) {
+        clearInterruptedHapticsIfReady()
         guard run != nil else { return }
         drive(.tick, now: now)
     }
@@ -171,8 +191,11 @@ final class WakeAlarmRunner {
     func writeError(_ detail: String, at: Date) {
         guard run != nil else { return }
         let now = Date()
+        // Charge first: after a slow main-actor hop the buzz's window may look expired, and settling
+        // first would credit a real failure as a success.
+        let charged = ledger.writeError(at: at)
         settleBuzzes(now: now)
-        guard run != nil, ledger.writeError(at: at) else { return }
+        guard charged, run != nil else { return }
         step(.buzzResult(ok: false, detail: detail), now: now)
     }
 
@@ -182,6 +205,18 @@ final class WakeAlarmRunner {
         let actions = WakeLoopEngine.stop(&state, reason: .stopped)
         run = state
         perform(actions, now: now)
+    }
+
+    /// The interrupted-run clear: a single STOP_HAPTICS attempt the first time the link is ready, no retry.
+    private func clearInterruptedHapticsIfReady() {
+        guard interruptedClearPending, let model = AppModel.shared, model.ble.wakeLinkReady else { return }
+        interruptedClearPending = false
+        model.stopHaptics()
+        strapLog(WakeLogText.interruptedHapticsCleared)
+        if run == nil {
+            BLEManager.wakeFrameObserver = nil
+            BLEManager.wakeWriteErrorObserver = nil
+        }
     }
 
     // MARK: engine plumbing
