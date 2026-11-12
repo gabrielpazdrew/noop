@@ -8,6 +8,14 @@ enum WakeScreenText {
     /// How many past runs the screen lists.
     static let shownRuns = 7
 
+    /// The warning shown while upstream's own Alarms toggle (`smartAlarmEnabled`) is on; nil when it is off.
+    /// The screen only reads that setting, never writes it.
+    static func bandAlarmWarning(smartAlarmOn: Bool) -> String? {
+        smartAlarmOn
+            ? "NOOP's own Alarms toggle is on. It buzzes the band at a set clock time every day, separately from this wake alarm. Turn it off under More → App → Alarms."
+            : nil
+    }
+
     /// "6:05 am" (12-hour, lowercase am/pm, in the calendar's time zone).
     static func time(_ date: Date, calendar: Calendar) -> String {
         let f = DateFormatter()

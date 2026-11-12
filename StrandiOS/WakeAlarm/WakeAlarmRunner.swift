@@ -111,8 +111,10 @@ final class WakeAlarmRunner {
         // already in flight: wait for it inside the same budget (a second refresh would supersede it with a
         // shorter window), then go on either way; the source line then says median or fallback.
         while !model.repo.loaded && Date() < deadline {
+            guard !Task.isCancelled else { return .notReady }   // a cancelled intent starts no run
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
+        guard !Task.isCancelled else { return .notReady }
         let resting = WakeLoopEngine.newestRestingHR(model.repo.days.map { (day: $0.day, restingHr: $0.restingHr) })
         var stored: [WakeSample] = []
         if resting == nil {
@@ -163,9 +165,10 @@ final class WakeAlarmRunner {
 
     private func waitForModel(until deadline: Date) async -> AppModel? {
         while AppModel.shared == nil && Date() < deadline {
+            guard !Task.isCancelled else { return nil }   // cancelled: ends as "not ready", never spins
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        return AppModel.shared
+        return Task.isCancelled ? nil : AppModel.shared
     }
 
     // MARK: events

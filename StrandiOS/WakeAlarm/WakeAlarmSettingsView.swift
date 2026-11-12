@@ -13,6 +13,8 @@ struct WakeAlarmSettingsView: View {
 
     @State private var enabled = true
     @State private var skipDay: String? = nil
+    /// Upstream's own Alarms toggle, read only (never written here).
+    @State private var bandAlarmWarning: String? = nil
     @State private var revision = 0 // bumped after a tap to re-read the run state
 
     var body: some View {
@@ -34,6 +36,11 @@ struct WakeAlarmSettingsView: View {
         StrandCard(padding: 20) {
             VStack(alignment: .leading, spacing: 12) {
                 header("Wake alarm", icon: "alarm.fill")
+                if let bandAlarmWarning {
+                    Text(bandAlarmWarning)
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle(isOn: $enabled) {
                     Text("Wake alarm").font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
                 }
@@ -110,6 +117,7 @@ struct WakeAlarmSettingsView: View {
         s.clearSkipIfPassed(now: Date(), calendar: calendar)
         enabled = s.enabled
         skipDay = s.skipDay
+        bandAlarmWarning = WakeScreenText.bandAlarmWarning(smartAlarmOn: AppModel.shared?.behavior.smartAlarmEnabled ?? false)
         revision += 1
     }
 
@@ -118,9 +126,5 @@ struct WakeAlarmSettingsView: View {
         s.skipDay = day
         skipDay = s.skipDay
     }
-}
-
-#Preview {
-    NavigationStack { WakeAlarmSettingsView() }
 }
 #endif

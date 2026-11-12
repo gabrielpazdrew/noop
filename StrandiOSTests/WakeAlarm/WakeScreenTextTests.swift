@@ -19,6 +19,12 @@ final class WakeScreenTextTests: XCTestCase {
                       buzzCount: buzz, confirmedBuzzCount: confirmed, skippedCount: skipped, maxBpm: nil)
     }
 
+    func testBandAlarmWarningOnlyWhenUpstreamAlarmIsOn() {
+        XCTAssertNil(WakeScreenText.bandAlarmWarning(smartAlarmOn: false))
+        XCTAssertEqual(WakeScreenText.bandAlarmWarning(smartAlarmOn: true),
+                       "NOOP's own Alarms toggle is on. It buzzes the band at a set clock time every day, separately from this wake alarm. Turn it off under More → App → Alarms.")
+    }
+
     func testTwelveHourTimeWithLowercaseAmPm() {
         XCTAssertEqual(WakeScreenText.time(at(6, 5), calendar: cal), "6:05 am")
         XCTAssertEqual(WakeScreenText.time(at(0, 0), calendar: cal), "12:00 am")
