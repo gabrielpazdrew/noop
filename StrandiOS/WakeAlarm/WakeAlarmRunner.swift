@@ -1,0 +1,296 @@
+// Fork-only (phone-hub, wake). PLAN-WAKE-PHONE T3: the wake alarm's iOS glue.
+//
+// Owns the single live wake run: starts it (only from `trigger`, which only the "Start Wake Alarm"
+// Shortcuts action calls), feeds it every heart-rate sample and every other Bluetooth wake-up, carries
+// out the engine's actions, and cleans up on every stop. Every decision lives in Core/ (engine, gate,
+// ledger); this file only wires them to BLEManager, AppModel and UIKit. It is the ONLY caller of
+// `BLEManager.wakeBuzz()`. No timers: nothing here runs by the clock, so nothing here can buzz by the clock.
+#if os(iOS)
+import Foundation
+import UIKit
+
+/// What a "Start Wake Alarm" request came to.
+enum WakeStartOutcome: Equatable {
+    case decided(WakeTriggerDecision)
+    /// The gate said start, but NOOP's app model didn't exist within the wait: no run, no marker.
+    case notReady
+}
+
+@MainActor
+final class WakeAlarmRunner {
+    static let shared = WakeAlarmRunner()
+
+    /// Where the switch, "Skip tomorrow", the run records and the live-run marker live (the Wake Alarm
+    /// screen reads the same store).
+    static let defaults = UserDefaults.standard
+    /// How long a trigger waits for the app model (and for its first data load) on a cold launch.
+    static let modelWaitSeconds: TimeInterval = 8
+
+    let config = WakeConfig()
+
+    private var ring = WakeSampleRing()
+    private var run: WakeRunState?
+    private var runSource: WakeThresholdSource = .fallback
+    private var ledger = WakeBuzzLedger()
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// A trigger is between the gate and the run start (it awaits the model): a second trigger is ignored.
+    private var starting = false
+    private var launched = false
+
+    private init() {}
+
+    var isRunning: Bool { run != nil }
+
+    private var settings: WakeAlarmSettings { WakeAlarmSettings(defaults: Self.defaults) }
+    private var runLog: WakeRunLog { WakeRunLog(defaults: Self.defaults) }
+
+    // MARK: launch
+
+    /// Every process launch (StrandiOSApp.init, after AppModel exists). A marker left by an earlier
+    /// process becomes an `interrupted` record and is cleared: a relaunched app never resumes a run.
+    func appLaunched(now: Date = Date()) {
+        guard !launched else { return }
+        launched = true
+        // The HR observer is always on: it only fills the in-memory 20-minute ring while no run is live.
+        BLEManager.wakeHeartRateObserver = { bpm, at in
+            Task { @MainActor in WakeAlarmRunner.shared.heartRate(bpm: bpm, at: at) }
+        }
+        let log = runLog
+        if let started = log.activeRunStartedAt {
+            log.append(WakeRunRecord(started: started, ended: now, stopReason: .interrupted,
+                                     thresholdSource: "unknown", buzzCount: 0, confirmedBuzzCount: 0,
+                                     skippedCount: 0, maxBpm: nil))
+            log.activeRunStartedAt = nil
+            strapLog(WakeLogText.interrupted)
+        }
+        var s = settings
+        s.clearSkipIfPassed(now: now, calendar: .current)
+    }
+
+    // MARK: trigger (the only way a run starts)
+
+    func trigger(now: Date = Date()) async -> WakeStartOutcome {
+        var s = settings
+        s.clearSkipIfPassed(now: now, calendar: .current)
+
+        // A run whose events died stays in memory until something steps it. Probe a copy with the link
+        // reported down (so the probe can never ask for a buzz); only a stop it reaches is carried out, so a
+        // stale run (timeout / noHR / clockMoved) records itself before the gate looks.
+        if var probe = run {
+            let actions = WakeLoopEngine.step(&probe, .tick, now: now, linkReady: false, config: config)
+            if let reason = probe.stopReason, actions.contains(.stop(reason)) {
+                run = probe
+                finish(reason: reason, now: now)
+            }
+        }
+
+        let decision: WakeTriggerDecision
+        if run != nil || starting {
+            decision = .ignoredLiveRun
+        } else {
+            decision = WakeTriggerGate.decide(settings: s, activeRunStartedAt: runLog.activeRunStartedAt,
+                                              now: now, cap: config.cap)
+        }
+        if decision != .start {
+            // Log the skip if the model is (or soon is) there; a skip never waits on anything else.
+            _ = await waitForModel(until: now.addingTimeInterval(Self.modelWaitSeconds))
+            switch decision {
+            case .ignoredLiveRun:  strapLog(WakeLogText.ignoredLiveRun)
+            case .skippedOff:      strapLog(WakeLogText.skippedOff)
+            case .skippedTomorrow: strapLog(WakeLogText.skippedTomorrow(day: s.skipDay ?? "?", calendar: .current))
+            case .start:           break
+            }
+            return .decided(decision)
+        }
+
+        starting = true
+        defer { starting = false }
+        let deadline = now.addingTimeInterval(Self.modelWaitSeconds)
+        guard let model = await waitForModel(until: deadline) else { return .notReady }
+        // A cold background launch may not have loaded the daily rows yet. AppModel's own launch refresh is
+        // already in flight: wait for it inside the same budget (a second refresh would supersede it with a
+        // shorter window), then go on either way; the source line then says median or fallback.
+        while !model.repo.loaded && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        let resting = WakeLoopEngine.newestRestingHR(model.repo.days.map { (day: $0.day, restingHr: $0.restingHr) })
+        var stored: [WakeSample] = []
+        if resting == nil {
+            let to = Date()
+            let rows = await model.repo.hrSamples(from: Int(to.addingTimeInterval(-config.medianWindow).timeIntervalSince1970),
+                                                  to: Int(to.timeIntervalSince1970))
+            stored = rows.map { WakeSample(ts: Date(timeIntervalSince1970: TimeInterval($0.ts)), bpm: $0.bpm) }
+        }
+
+        let started = Date()
+        let recent = WakeSampleRing.mergeRecent(ring: ring.samples, stored: stored, now: started,
+                                                window: config.medianWindow)
+        let (threshold, source) = WakeLoopEngine.pickThreshold(restingHR: resting, recent: recent, config: config)
+        // The look-back: ring samples from the `sustain + 1` s before the start, replayed as events below.
+        let lookBack = ring.samples(after: started.addingTimeInterval(-config.sustain - 1), through: started)
+
+        run = WakeRunState.begin(started: started, threshold: threshold, warmup: lookBack, config: config)
+        runSource = source
+        ledger = WakeBuzzLedger()
+        runLog.activeRunStartedAt = started
+        installRunObservers()
+        beginBackgroundTask()
+        strapLog(WakeLogText.start(threshold: threshold, source: source,
+                                   bandAlarmOn: model.behavior.smartAlarmEnabled))
+        for sample in lookBack where run != nil {
+            step(.sample(sample), now: Date())
+        }
+        return .decided(.start)
+    }
+
+    private func waitForModel(until deadline: Date) async -> AppModel? {
+        while AppModel.shared == nil && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return AppModel.shared
+    }
+
+    // MARK: events
+
+    /// Every readable HR sample, stamped on arrival. With no live run it only fills the ring.
+    func heartRate(bpm: Int, at: Date) {
+        let sample = WakeSample(ts: at, bpm: bpm)
+        ring.append(sample)
+        guard run != nil else { return }
+        drive(.sample(sample), now: Date())
+    }
+
+    /// Any other app wake-up (an inbound Bluetooth frame). No-op with no live run.
+    func wake(now: Date = Date()) {
+        guard run != nil else { return }
+        drive(.tick, now: now)
+    }
+
+    /// A failed acknowledged command write (`at` = when the observer saw it). Counted only when it falls
+    /// inside a buzz's 3 s window, and at most once per buzz (WakeBuzzLedger).
+    func writeError(_ detail: String, at: Date) {
+        guard run != nil else { return }
+        let now = Date()
+        settleBuzzes(now: now)
+        guard run != nil, ledger.writeError(at: at) else { return }
+        step(.buzzResult(ok: false, detail: detail), now: now)
+    }
+
+    /// The Wake Alarm screen's "Stop now", or its switch turned off mid-run.
+    func stopNow(now: Date = Date()) {
+        guard var state = run else { return }
+        let actions = WakeLoopEngine.stop(&state, reason: .stopped)
+        run = state
+        perform(actions, now: now)
+    }
+
+    // MARK: engine plumbing
+
+    private func drive(_ event: WakeEvent, now: Date) {
+        settleBuzzes(now: now)
+        step(event, now: now)
+    }
+
+    /// Buzzes whose 3 s passed with no write error are reported to the engine as written OK.
+    private func settleBuzzes(now: Date) {
+        let ok = ledger.expire(now: now)
+        for _ in 0..<ok where run != nil {
+            step(.buzzResult(ok: true, detail: ""), now: now)
+        }
+    }
+
+    private func step(_ event: WakeEvent, now: Date) {
+        guard var state = run else { return }
+        let linkReady = AppModel.shared?.ble.wakeLinkReady ?? false
+        let actions = WakeLoopEngine.step(&state, event, now: now, linkReady: linkReady, config: config)
+        run = state
+        perform(actions, now: now)
+    }
+
+    private func perform(_ actions: [WakeAction], now: Date) {
+        for action in actions {
+            guard run != nil else { return }
+            switch action {
+            case .buzz:
+                // The one wakeBuzz() call site in the fork.
+                if AppModel.shared?.ble.wakeBuzz() == true {
+                    ledger.sent(at: now)
+                    strapLog(WakeLogText.buzz(run?.buzzCount ?? 0))
+                } else {
+                    // Link dropped between the engine's check and the write: nothing was sent.
+                    step(.buzzResult(ok: false, detail: "not sent, link not ready"), now: now)
+                }
+            case .skipBuzz(let reason):
+                strapLog(WakeLogText.skipped(reason))
+            case .log(let line):
+                strapLog(WakeLogText.engine(line))
+            case .stop(let reason):
+                finish(reason: reason, now: now)
+            }
+        }
+    }
+
+    /// Every stop ends here, exactly once per run.
+    private func finish(reason: WakeStopReason, now: Date) {
+        guard let state = run else { return }
+        run = nil
+        BLEManager.wakeFrameObserver = nil
+        BLEManager.wakeWriteErrorObserver = nil
+        ledger = WakeBuzzLedger()
+        if state.buzzCount > 0 { AppModel.shared?.stopHaptics() }   // clears a wedged pattern (#769)
+        let log = runLog
+        log.append(WakeRunRecord(started: state.started, ended: now, stopReason: reason,
+                                 thresholdSource: runSource.logDescription,
+                                 buzzCount: state.buzzCount, confirmedBuzzCount: state.confirmedBuzzCount,
+                                 skippedCount: state.skippedCount, maxBpm: state.maxBpm))
+        log.activeRunStartedAt = nil
+        strapLog(WakeLogText.stop(state, reason: reason, now: now))
+        endBackgroundTask()
+    }
+
+    // MARK: hooks and process time
+
+    /// Frame and write-error observers exist only while a run is live (set here, cleared in `finish`).
+    /// Both run inside main-actor CoreBluetooth callbacks, so they only note the time and hop; nothing is
+    /// decided, and nothing buzzes, inside the callback.
+    private func installRunObservers() {
+        final class Throttle { var last = Date.distantPast }
+        let throttle = Throttle()
+        BLEManager.wakeFrameObserver = { at in
+            guard abs(at.timeIntervalSince(throttle.last)) >= 1 else { return }   // a sync can send hundreds/s
+            throttle.last = at
+            Task { @MainActor in WakeAlarmRunner.shared.wake(now: Date()) }
+        }
+        BLEManager.wakeWriteErrorObserver = { detail in
+            let at = Date()
+            Task { @MainActor in WakeAlarmRunner.shared.writeError(detail, at: at) }
+        }
+    }
+
+    /// Asks iOS for background time while the run is live. The expiry handler only ends the assertion: the
+    /// run goes on, driven by Bluetooth wake-ups, and still stops by its own limits.
+    private func beginBackgroundTask() {
+        endBackgroundTask()
+        let app = UIApplication.shared
+        var id: UIBackgroundTaskIdentifier = .invalid
+        id = app.beginBackgroundTask(withName: "wake-alarm-run") {
+            MainActor.assumeIsolated {
+                if WakeAlarmRunner.shared.backgroundTask == id { WakeAlarmRunner.shared.backgroundTask = .invalid }
+            }
+            app.endBackgroundTask(id)
+        }
+        backgroundTask = id
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        let id = backgroundTask
+        backgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(id)
+    }
+
+    private func strapLog(_ line: String) {
+        AppModel.shared?.live.append(log: AppModel.stamped(line))
+    }
+}
+#endif

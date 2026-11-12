@@ -99,6 +99,8 @@ struct StrandiOSApp: App {
         // Fork-only (phone-hub): band-link watchers + notice re-plan on every launch, including a
         // background Bluetooth restoration launch that never brings up a scene (PLAN-BAND-LINK T3).
         HubNotifications.appLaunched()
+        // Fork-only (phone-hub, wake): HR ring hook + clear a run marker a killed process left (never resumed).
+        WakeAlarmRunner.shared.appLaunched()
         // iOS's own daily report of NOOP's CPU, memory, disk writes, hangs and exits, and its crash/hang reports,
         // one strap-log line each. Registering is the whole cost; iOS gathers and delivers them (MetricKitLog).
         MetricKitLog.shared.attach(to: model.live)
