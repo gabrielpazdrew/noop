@@ -37,7 +37,14 @@ final class WakeScreenTextTests: XCTestCase {
         XCTAssertEqual(WakeScreenText.stopReason(.timeout), "the 45-minute watch window ended")
         XCTAssertEqual(WakeScreenText.stopReason(.buzzBudget), "10 minutes of buzzing in total")
         XCTAssertEqual(WakeScreenText.stopReason(.noLink), "the band wasn't connected, so it couldn't buzz")
-        XCTAssertEqual(WakeScreenText.noLinkDialog, "Band isn't connected — the wake alarm can't buzz this morning.")
+        XCTAssertEqual(WakeScreenText.stopReason(.noLink, noLinkCase: .notConnected),
+                       "the band wasn't connected, so it couldn't buzz")
+        XCTAssertEqual(WakeScreenText.stopReason(.noLink, noLinkCase: .connectedNoHR),
+                       "the band sent no heart rate (off your wrist?), so it couldn't buzz")
+        XCTAssertEqual(WakeScreenText.noLinkDialog(.notConnected),
+                       "Band isn't connected — the wake alarm can't buzz this morning.")
+        XCTAssertEqual(WakeScreenText.noLinkDialog(.connectedNoHR),
+                       "No heart rate from the band — the wake alarm can't buzz this morning.")
         XCTAssertEqual(WakeScreenText.stopReason(.noHR), "no heart rate from the band for 2 minutes")
         XCTAssertEqual(WakeScreenText.stopReason(.buzzFailed), "the band missed 3 buzzes in a row")
         XCTAssertEqual(WakeScreenText.stopReason(.stopped), "you tapped Stop or turned the alarm off")
@@ -67,6 +74,15 @@ final class WakeScreenTextTests: XCTestCase {
                        "Stopped: no heart rate from the band for 2 minutes. 1 buzz (0 confirmed), 0 skipped.")
         XCTAssertEqual(WakeScreenText.runDetail(makeRecord(at(6, 30), at(6, 30), .interrupted)),
                        "Stopped: NOOP was closed or restarted mid-run. No buzzes, 0 skipped.")
+    }
+
+    func testRunDetailNamesWhichNoLinkCase() {
+        var r = makeRecord(at(6, 30), at(6, 30, 22), .noLink)
+        XCTAssertEqual(WakeScreenText.runDetail(r),
+                       "Stopped: the band wasn't connected, so it couldn't buzz. No buzzes, 0 skipped.")
+        r.noLinkCase = .connectedNoHR
+        XCTAssertEqual(WakeScreenText.runDetail(r),
+                       "Stopped: the band sent no heart rate (off your wrist?), so it couldn't buzz. No buzzes, 0 skipped.")
     }
 
     func testRunDetailShowsTheV2LoopCountsWhenPresent() {

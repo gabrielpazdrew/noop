@@ -6,7 +6,12 @@ import Foundation
 
 enum WakeScreenText {
     /// What "Start Wake Alarm" says (the automation's Show When Run banner) when the run ended `.noLink`.
-    static let noLinkDialog = "Band isn't connected — the wake alarm can't buzz this morning."
+    static func noLinkDialog(_ c: WakeNoLinkCase) -> String {
+        switch c {
+        case .notConnected:  return "Band isn't connected — the wake alarm can't buzz this morning."
+        case .connectedNoHR: return "No heart rate from the band — the wake alarm can't buzz this morning."
+        }
+    }
 
     /// How many past runs the screen lists.
     static let shownRuns = 7
@@ -32,12 +37,15 @@ enum WakeScreenText {
     }
 
     /// Why a run stopped, in plain words (completes "Stopped: …").
-    static func stopReason(_ reason: WakeStopReason) -> String {
+    static func stopReason(_ reason: WakeStopReason, noLinkCase: WakeNoLinkCase? = nil) -> String {
         let config = WakeConfig()
         switch reason {
         case .awake: return "you were up (heart rate stayed high)"
         case .timeout: return "the \(Int(config.watchWindow) / 60)-minute watch window ended"
-        case .noLink: return "the band wasn't connected, so it couldn't buzz"
+        case .noLink:
+            return noLinkCase == .connectedNoHR
+                ? "the band sent no heart rate (off your wrist?), so it couldn't buzz"
+                : "the band wasn't connected, so it couldn't buzz"
         case .buzzBudget: return "\(Int(config.buzzBudget) / 60) minutes of buzzing in total"
         case .noHR: return "no heart rate from the band for \(Int(config.noHRLimit) / 60) minutes"
         case .buzzFailed: return "the band missed \(config.maxBuzzFailures) buzzes in a row"
@@ -74,7 +82,7 @@ enum WakeScreenText {
             let buzzing = b < 60 ? "\(b) s" : "\(b / 60) min"
             loop = "Up \(q)× · back asleep \(a)× · buzzing \(buzzing) · "
         }
-        return "Stopped: \(stopReason(r.stopReason)). \(loop)\(buzzes), \(r.skippedCount) skipped."
+        return "Stopped: \(stopReason(r.stopReason, noLinkCase: r.noLinkCase)). \(loop)\(buzzes), \(r.skippedCount) skipped."
     }
 
     /// The newest `shownRuns` records, newest first (`WakeRunLog.records` is oldest first).

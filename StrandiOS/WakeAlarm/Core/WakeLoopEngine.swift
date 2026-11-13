@@ -116,6 +116,11 @@ enum WakeStopReason: String, Codable, Equatable {
     case noLink
 }
 
+/// Which `.noLink` it was: the link never came up, or it came up but sent no heart rate (e.g. off the wrist).
+enum WakeNoLinkCase: String, Codable, Equatable {
+    case notConnected, connectedNoHR
+}
+
 /// The start-of-run wait for a live HR sample (pure, so the decision is unit-tested; the runner polls).
 enum WakeLinkWait: Equatable {
     case proceed, wait, noLink
@@ -138,7 +143,8 @@ enum WakeMode: String, Equatable {
 enum WakeEvent: Equatable {
     /// One heart-rate sample, stamped on arrival.
     case sample(WakeSample)
-    /// Any other wake-up of the app (a non-HR Bluetooth frame, a UI action). Not a timer.
+    /// Any other wake-up of the app: a non-HR Bluetooth frame, a UI action, or the runner's 5 s run clock
+    /// (only while a run is live). A tick never buzzes before the run has walked a heart-rate sample.
     case tick
     /// The outcome of the runner's last buzz write.
     case buzzResult(ok: Bool, detail: String)
@@ -168,7 +174,8 @@ struct WakeRunState: Equatable {
     /// Samples walked since the current mode began, oldest first, trimmed to that mode's sustain window
     /// (by sample time). Bounded: at most one sustain window of samples.
     var window: [WakeSample]
-    /// Wall clock of the last step that walked a not-yet-seen sample (the buzz gate reads it).
+    /// Wall clock of the last step that walked a not-yet-seen sample (the buzz gate reads it). Starts at
+    /// `.distantPast`: no buzz until the run has walked at least one sample (no buzz without heart rate).
     var lastNewAt: Date
     /// Wall clock of the last step that saw a live sample (the no-HR stop reads it).
     var lastLiveAt: Date
@@ -205,7 +212,7 @@ struct WakeRunState: Equatable {
                      lastSeenTs: .distantPast,
                      modeSince: started,
                      window: [],
-                     lastNewAt: started,
+                     lastNewAt: .distantPast,
                      lastLiveAt: started,
                      lastBuzzAt: .distantPast,
                      newestNow: started,
@@ -408,7 +415,10 @@ enum WakeLoopEngine {
         guard now.timeIntervalSince(state.lastBuzzAt) >= config.buzzSpacing else { return actions }
         state.lastBuzzAt = now
         let sinceNew = now.timeIntervalSince(state.lastNewAt)
-        if sinceNew > config.buzzStall {
+        if state.lastNewAt == .distantPast {
+            state.skippedCount += 1
+            actions.append(.skipBuzz(reason: "no heart rate yet"))
+        } else if sinceNew > config.buzzStall {
             state.skippedCount += 1
             actions.append(.skipBuzz(reason: "no new HR sample for \(Int(sinceNew))s"))
         } else if !linkReady {

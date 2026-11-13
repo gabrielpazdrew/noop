@@ -168,7 +168,7 @@ final class WakeLoopEngineTests: XCTestCase {
         let s = WakeRunState.begin(started: t0, upLine: 70, asleepLine: 63, warmup: warm, config: cfg)
         XCTAssertEqual(s.mode, .buzzing)
         XCTAssertEqual(s.lastLiveAt, t0)
-        XCTAssertEqual(s.lastNewAt, t0)
+        XCTAssertEqual(s.lastNewAt, .distantPast, "no sample walked yet: the stall gate starts closed")
         XCTAssertEqual(s.maxBpm, 61)
         XCTAssertNil(s.stopReason)
         XCTAssertEqual(s.buzzCount, 0)
@@ -288,7 +288,7 @@ final class WakeLoopEngineTests: XCTestCase {
         step(&s, sample(40, 90), now: 10)
         XCTAssertEqual(s.lastSeenTs, .distantPast)
         XCTAssertEqual(s.window.count, 0)
-        XCTAssertEqual(s.lastNewAt, t0)
+        XCTAssertEqual(s.lastNewAt, .distantPast)
         // The sample can still be walked once the clock reaches it.
         step(&s, sample(40, 90), now: 40)
         XCTAssertEqual(s.window.count, 1)
@@ -606,7 +606,7 @@ final class WakeLoopEngineTests: XCTestCase {
 
     func testNoLinkStopIsFinal() {
         var s = makeRun()
-        XCTAssertEqual(step(&s, .tick, now: 5, link: false), [.skipBuzz(reason: "link not ready")])
+        XCTAssertEqual(step(&s, .tick, now: 5, link: false), [.skipBuzz(reason: "no heart rate yet")])
         XCTAssertEqual(WakeLoopEngine.stop(&s, reason: .noLink), [.stop(.noLink)])
         XCTAssertEqual(step(&s, sample(23, 55), now: 23), [])
         XCTAssertEqual(s.buzzCount, 0)
@@ -717,11 +717,24 @@ final class WakeLoopEngineTests: XCTestCase {
 
     // MARK: buzz gate
 
-    func testFirstEventBuzzesWhenLinkReady() {
+    func testNoBuzzBeforeTheFirstSampleEvenWithTheLinkReady() {
         var s = makeRun()
-        XCTAssertEqual(step(&s, .tick, now: 0), [.buzz])
+        var all: [WakeAction] = []
+        for t in stride(from: 0.0, through: 60.0, by: 5.0) { all += step(&s, .tick, now: t) }   // the 5 s ticks
+        XCTAssertEqual(buzzes(all), 0, "no heart rate yet: never a buzz")
+        XCTAssertEqual(Set(skips(all)), ["no heart rate yet"])
+        XCTAssertEqual(s.buzzCount, 0)
+    }
+
+    func testFirstSampleBuzzes() {
+        var s = makeRun()
+        XCTAssertEqual(skips(step(&s, .tick, now: 0)), ["no heart rate yet"])
+        XCTAssertEqual(step(&s, sample(1, 55), now: 1), [], "the tick's skip at 0 still holds the 2 s spacing")
+        XCTAssertEqual(step(&s, sample(2, 55), now: 2), [.buzz])
         XCTAssertEqual(s.buzzCount, 1)
-        XCTAssertEqual(s.lastBuzzAt, t0)
+        XCTAssertEqual(s.lastBuzzAt, at(2))
+        var s2 = makeRun()
+        XCTAssertEqual(step(&s2, sample(0, 55), now: 0), [.buzz], "a sample as the first event buzzes at once")
     }
 
     func testBuzzPausesWhileStreamStalled() {

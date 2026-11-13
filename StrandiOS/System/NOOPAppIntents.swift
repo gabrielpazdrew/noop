@@ -125,8 +125,9 @@ struct StartWakeAlarmIntent: AppIntent {
         case .decided(.skippedTomorrow): return .result(dialog: "Skipping this morning.")
         case .decided(.ignoredLiveRun):  return .result(dialog: "Wake alarm already running.")
         case .notReady:                  return .result(dialog: "NOOP wasn't ready, so the wake alarm didn't start.")
-        // Same text as WakeScreenText.noLinkDialog (a literal here: the dialog type is built from one).
-        case .noLink:                    return .result(dialog: "Band isn't connected — the wake alarm can't buzz this morning.")
+        // Same texts as WakeScreenText.noLinkDialog (literals here: the dialog type is built from one).
+        case .noLink(.notConnected):     return .result(dialog: "Band isn't connected — the wake alarm can't buzz this morning.")
+        case .noLink(.connectedNoHR):    return .result(dialog: "No heart rate from the band — the wake alarm can't buzz this morning.")
         }
     }
 }

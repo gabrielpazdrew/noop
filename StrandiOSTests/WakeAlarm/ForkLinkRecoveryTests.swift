@@ -41,26 +41,31 @@ final class ForkLinkRecoveryTests: XCTestCase {
 
     func testWakeLinkRequestGate() {
         typealias R = ForkLinkRecovery.WakeLinkRequest
-        func gate(_ c: Bool, _ i: Bool, _ p: Bool, _ pin: Bool) -> R {
-            ForkLinkRecovery.wakeLinkRequest(connected: c, intentionalDisconnect: i, poweredOn: p, hasPinnedStrap: pin)
+        func gate(_ c: Bool, _ i: Bool, _ p: Bool, _ target: Bool, allowed: Bool = true) -> R {
+            ForkLinkRecovery.wakeLinkRequest(connected: c, intentionalDisconnect: i, poweredOn: p,
+                                             hasTargetStrap: target, connectAllowed: allowed)
         }
         XCTAssertEqual(gate(false, false, true, true), .requested)
         XCTAssertEqual(gate(true, false, true, true), .alreadyConnected)
         XCTAssertEqual(gate(false, true, true, true), .userDisconnected, "never undoes a deliberate Disconnect")
         XCTAssertEqual(gate(false, false, false, true), .bluetoothOff)
-        XCTAssertEqual(gate(false, false, true, false), .noPinnedStrap, "no scan fallback")
-        XCTAssertEqual(gate(true, true, false, false), .alreadyConnected)
+        XCTAssertEqual(gate(false, false, true, false), .noTargetStrap)
+        XCTAssertEqual(gate(false, false, true, true, allowed: false), .otherDeviceActive,
+                       "never claims a request the active-device gate would drop")
+        XCTAssertEqual(gate(true, true, false, false, allowed: false), .alreadyConnected)
     }
 
     func testWakeLinkRequestLogLines() {
         XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.requested.logLine,
-                       "Wake: link requested (targeted connect to the selected strap; the bond-loop pause is left as is)")
+                       "Wake: link requested (system connect to the strap; the bond-loop pause is left as is)")
         XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.userDisconnected.logLine,
                        "Wake: link not requested (disconnected by hand)")
         XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.bluetoothOff.logLine,
                        "Wake: link not requested (Bluetooth is off)")
-        XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.noPinnedStrap.logLine,
-                       "Wake: link not requested (no selected strap to target)")
+        XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.noTargetStrap.logLine,
+                       "Wake: link not requested (no selected or last-connected strap to target)")
+        XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.otherDeviceActive.logLine,
+                       "Wake: link not requested (a different device is active)")
         XCTAssertEqual(ForkLinkRecovery.WakeLinkRequest.alreadyConnected.logLine,
                        "Wake: link not requested (already connected, handshake in progress)")
     }

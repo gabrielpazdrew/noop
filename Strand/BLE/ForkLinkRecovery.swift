@@ -32,28 +32,32 @@ enum ForkLinkRecovery {
 
     /// C: what the wake alarm's link request does.
     enum WakeLinkRequest: String, Equatable {
-        case requested, alreadyConnected, userDisconnected, bluetoothOff, noPinnedStrap
+        case requested, alreadyConnected, userDisconnected, bluetoothOff, otherDeviceActive, noTargetStrap
 
         var logLine: String {
             switch self {
             case .requested:
-                return "Wake: link requested (targeted connect to the selected strap; the bond-loop pause is left as is)"
+                return "Wake: link requested (system connect to the strap; the bond-loop pause is left as is)"
             case .alreadyConnected: return "Wake: link not requested (already connected, handshake in progress)"
             case .userDisconnected: return "Wake: link not requested (disconnected by hand)"
             case .bluetoothOff:     return "Wake: link not requested (Bluetooth is off)"
-            case .noPinnedStrap:    return "Wake: link not requested (no selected strap to target)"
+            case .otherDeviceActive: return "Wake: link not requested (a different device is active)"
+            case .noTargetStrap:    return "Wake: link not requested (no selected or last-connected strap to target)"
             }
         }
     }
 
     /// C: request a link only when nothing is connected, the user didn't disconnect on purpose (a connect would
-    /// clear that), Bluetooth is on, and there is a selected strap to target (never a scan).
+    /// clear that), Bluetooth is on, the active-device gate `connectFromSystem` applies would let it through
+    /// (so the log never claims a request that silently didn't happen), and there is a strap to target: the
+    /// selected one, or the last-connected one, which `connectCore` targets by identifier off-screen.
     static func wakeLinkRequest(connected: Bool, intentionalDisconnect: Bool, poweredOn: Bool,
-                                hasPinnedStrap: Bool) -> WakeLinkRequest {
+                                hasTargetStrap: Bool, connectAllowed: Bool) -> WakeLinkRequest {
         if connected { return .alreadyConnected }
         if intentionalDisconnect { return .userDisconnected }
         if !poweredOn { return .bluetoothOff }
-        if !hasPinnedStrap { return .noPinnedStrap }
+        if !connectAllowed { return .otherDeviceActive }
+        if !hasTargetStrap { return .noTargetStrap }
         return .requested
     }
 }

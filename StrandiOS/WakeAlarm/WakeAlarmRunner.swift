@@ -6,7 +6,8 @@
 // ledger); this file only wires them to BLEManager, AppModel and UIKit. It is the ONLY caller of
 // `BLEManager.wakeBuzz()`. Nothing here STARTS by the clock: the one timer (v2.1) exists only inside a run the
 // intent started, is cancelled in `finish`, and only feeds `.tick` so the run's limits fire while no Bluetooth
-// frames arrive; a tick can buzz only while live HR samples are still arriving (the engine's stall gate).
+// frames arrive. A tick never buzzes before the run has walked a heart-rate sample, and after that only while
+// samples keep arriving (the engine's stall gate).
 #if os(iOS)
 import Foundation
 import UIKit
@@ -17,7 +18,7 @@ enum WakeStartOutcome: Equatable {
     /// The gate said start, but NOOP's app model didn't exist within the wait: no run, no marker.
     case notReady
     /// v2.1: the run started, but no live HR arrived within `WakeConfig.linkWait`: ended as `.noLink`.
-    case noLink
+    case noLink(WakeNoLinkCase)
 }
 
 @MainActor
@@ -47,6 +48,8 @@ final class WakeAlarmRunner {
     private var ticker: Timer?
     /// v2.1: what this run's start-of-run link request did (nil when the link was ready).
     private var linkRequest: ForkLinkRecovery.WakeLinkRequest?
+    /// v2.1: which `.noLink` this run ended with (set just before that stop).
+    private var noLinkCase: WakeNoLinkCase = .notConnected
 
     private init() {}
 
@@ -159,12 +162,13 @@ final class WakeAlarmRunner {
                                    bandAlarmOn: model.behavior.smartAlarmEnabled))
         startTicker()
         linkRequest = nil
+        noLinkCase = .notConnected
 
         // v2.1: never sit silent with no band. No fresh HR → ask for the link (if it's down), then wait for a
         // live sample until `linkWait` after the trigger; none → end the run as noLink and say so. The link
         // request is left pending after the run, so data resumes; nothing here buzzes.
-        let deadline = now.addingTimeInterval(config.linkWait)
-        if WakeLinkWait.decide(newestSampleAt: ring.samples.last?.ts, now: Date(), deadline: deadline,
+        let linkDeadline = now.addingTimeInterval(config.linkWait)
+        if WakeLinkWait.decide(newestSampleAt: ring.samples.last?.ts, now: Date(), deadline: linkDeadline,
                                config: config) != .proceed {
             if !model.ble.wakeLinkReady {
                 linkRequest = model.ble.wakeRequestLink()
@@ -175,14 +179,18 @@ final class WakeAlarmRunner {
                 // Ended meanwhile (Stop now, a limit): nothing more to decide here.
                 guard let live = run, live.started == started else { return .decided(.start) }
                 let verdict = WakeLinkWait.decide(newestSampleAt: ring.samples.last?.ts, now: Date(),
-                                                  deadline: deadline, config: config)
+                                                  deadline: linkDeadline, config: config)
                 if verdict == .proceed { break }
                 if verdict == .noLink {
+                    // Which case, read at the deadline: a link that came up (or was up) but sent no HR is
+                    // "connected, no heart rate" (off the wrist?), not "not connected".
+                    let which: WakeNoLinkCase = model.ble.wakeLinkReady ? .connectedNoHR : .notConnected
+                    noLinkCase = which
                     var state = live
                     let actions = WakeLoopEngine.stop(&state, reason: .noLink)
                     run = state
                     perform(actions, now: Date())
-                    return .noLink
+                    return .noLink(which)
                 }
                 // A cancelled intent stops waiting; the run goes on and its own limits (ticks) end it.
                 if Task.isCancelled { break }
@@ -334,10 +342,12 @@ final class WakeAlarmRunner {
                                  buzzCount: state.buzzCount, confirmedBuzzCount: state.confirmedBuzzCount,
                                  skippedCount: state.skippedCount, maxBpm: state.maxBpm,
                                  quietCount: state.quietCount, rearmCount: state.rearmCount,
-                                 buzzingSeconds: Int(state.buzzingSeconds(at: max(now, state.started)))))
+                                 buzzingSeconds: Int(state.buzzingSeconds(at: max(now, state.started))),
+                                 noLinkCase: reason == .noLink ? noLinkCase : nil))
         log.activeRunStartedAt = nil
         if reason == .noLink {
             strapLog(WakeLogText.noLinkStop(secs: max(0, Int(now.timeIntervalSince(state.started))),
+                                            noLinkCase: noLinkCase,
                                             reconnectRequested: linkRequest == .requested))
         } else {
             strapLog(WakeLogText.stop(state, reason: reason, now: now))

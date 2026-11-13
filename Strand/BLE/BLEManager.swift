@@ -6049,6 +6049,10 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager,
                                didDisconnectPeripheral peripheral: CBPeripheral,
                                error: Error?) {
+        // fork-only (phone-hub, link): consume our own watchdog-bounce stamp on EVERY disconnect, so a stamp
+        // left by an unpaused bounce can never excuse a later, unrelated drop.
+        let forkOwnBounceAt = forkWatchdogBounceAt
+        forkWatchdogBounceAt = nil
         Task { @MainActor in await collector?.flush() }
         // Reboot trail: if a user reboot is in flight, this drop is the strap acting on it. Log how long
         // the link stayed up (a real reboot drops within ~1-2 s) and cancel the no-disconnect watchdog. The
@@ -6319,9 +6323,8 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             // strap that keeps refusing gets one attempt per window instead of a connect/refuse spin.
             // fork-only (phone-hub, link): our OWN watchdog bounce is not a refusal; it re-parks at once, so
             // the bounce can never leave the strap with no reconnect request at all.
-            let ownBounce = ForkLinkRecovery.pausedDisconnectBypassesFloor(watchdogBounceAt: forkWatchdogBounceAt,
+            let ownBounce = ForkLinkRecovery.pausedDisconnectBypassesFloor(watchdogBounceAt: forkOwnBounceAt,
                                                                            now: Date())
-            forkWatchdogBounceAt = nil
             standingConnectWhilePausedIfDue(justTripped: ownBounce)
             if TestCentre.active(.connection) {
                 state.append(log: "connect down (uptime ends)", domain: .connection)
@@ -7577,16 +7580,25 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
 // (nothing sets them on macOS). No new payloads or opcodes: wakeBuzz() only calls the existing buzzStrapOnce().
 extension BLEManager {
     /// fork-only (phone-hub, wake): the one link request a wake run makes when it starts with no link. A
-    /// SYSTEM connect (`connectFromSystem`: the #1881 active-device gate, never resets the bond-loop give-up),
-    /// targeted at the selected strap, no timeout, nothing written to the strap. Refused while connected (a
-    /// handshake may be in flight), after a deliberate Disconnect (connectCore would clear it), with
-    /// Bluetooth off, or with no selected strap (never a scan). Logs one line either way.
+    /// SYSTEM connect (`connectFromSystem`: never resets the bond-loop give-up), at the selected strap or the
+    /// last-connected one (by identifier; only with no selected strap AND the app on screen does `connectCore`
+    /// scan instead, which iOS allows there), no timeout,
+    /// nothing written to the strap. Refused while connected (a handshake may be in flight), after a
+    /// deliberate Disconnect (connectCore would clear it), with Bluetooth off, when the #1881 active-device
+    /// gate would drop it, or with no strap to target. Logs one line either way, and never claims a request
+    /// that didn't happen.
     @discardableResult
     func wakeRequestLink() -> ForkLinkRecovery.WakeLinkRequest {
-        let r = ForkLinkRecovery.wakeLinkRequest(connected: state.connected,
-                                                 intentionalDisconnect: intentionalDisconnect,
-                                                 poweredOn: central.state == .poweredOn,
-                                                 hasPinnedStrap: preferredPeripheralUUID != nil)
+        let hasTarget = preferredPeripheralUUID != nil || Self.lastConnectedPeripheralUUID != nil
+        func decide(allowed: Bool) -> ForkLinkRecovery.WakeLinkRequest {
+            ForkLinkRecovery.wakeLinkRequest(connected: state.connected,
+                                             intentionalDisconnect: intentionalDisconnect,
+                                             poweredOn: central.state == .poweredOn,
+                                             hasTargetStrap: hasTarget, connectAllowed: allowed)
+        }
+        // The gate has side effects (a refusal log line), so it only runs once the cheap checks pass.
+        var r = decide(allowed: true)
+        if r == .requested { r = decide(allowed: whoopConnectAllowed("wake-link")) }
         log(r.logLine)
         if r == .requested { connectFromSystem() }
         return r

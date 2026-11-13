@@ -30,8 +30,13 @@ enum WakeLogText {
     static let waitingForHR = "Wake: no fresh heart rate yet, waiting for the band"
 
     /// Replaces the usual stop line for a `.noLink` run.
-    static func noLinkStop(secs: Int, reconnectRequested: Bool) -> String {
-        "Wake: stop noLink — band not connected after \(secs)s (\(reconnectRequested ? "reconnect requested" : "no reconnect: link busy or disconnected by hand"))"
+    static func noLinkStop(secs: Int, noLinkCase: WakeNoLinkCase, reconnectRequested: Bool) -> String {
+        switch noLinkCase {
+        case .connectedNoHR:
+            return "Wake: stop noLink — band connected but no heart rate after \(secs)s"
+        case .notConnected:
+            return "Wake: stop noLink — band not connected after \(secs)s (\(reconnectRequested ? "reconnect requested" : "no reconnect requested"))"
+        }
     }
 
     static let ignoredLiveRun = "Wake: trigger ignored (run already live)"

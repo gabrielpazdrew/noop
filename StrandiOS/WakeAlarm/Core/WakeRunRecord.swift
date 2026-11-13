@@ -23,6 +23,8 @@ struct WakeRunRecord: Codable, Equatable {
     var rearmCount: Int? = nil
     /// Seconds spent buzzing, all buzzing stretches added up.
     var buzzingSeconds: Int? = nil
+    /// v2.1: set only on a `.noLink` record (nil reads as `.notConnected`).
+    var noLinkCase: WakeNoLinkCase? = nil
 
     /// What a relaunch records for a run the killed process left live: nothing about it is known.
     static func interrupted(started: Date, ended: Date) -> WakeRunRecord {

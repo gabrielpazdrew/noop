@@ -133,8 +133,11 @@ final class WakeAlarmSettingsTests: XCTestCase {
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r, noMax, v2])
         var noLink = makeRecord(4)
         noLink.stopReason = .noLink; noLink.quietCount = 0; noLink.rearmCount = 0; noLink.buzzingSeconds = 22
+        noLink.noLinkCase = .connectedNoHR
         log.append(noLink)
         XCTAssertEqual(WakeRunLog(defaults: defaults).records.last, noLink)
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records.last?.noLinkCase, .connectedNoHR)
+        XCTAssertNil(makeRecord(5).noLinkCase, "nil on every other record")
         XCTAssertEqual(WakeStopReason(rawValue: "noLink"), .noLink)
     }
 
