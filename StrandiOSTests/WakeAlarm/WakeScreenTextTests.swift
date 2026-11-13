@@ -13,7 +13,7 @@ final class WakeScreenTextTests: XCTestCase {
         cal.date(from: DateComponents(year: 2026, month: 3, day: day, hour: h, minute: m, second: s))!
     }
 
-    func record(_ start: Date, _ end: Date, _ reason: WakeStopReason,
+    func makeRecord(_ start: Date, _ end: Date, _ reason: WakeStopReason,
                 buzz: Int = 0, confirmed: Int = 0, skipped: Int = 0) -> WakeRunRecord {
         WakeRunRecord(started: start, ended: end, stopReason: reason, thresholdSource: "fallback",
                       buzzCount: buzz, confirmedBuzzCount: confirmed, skippedCount: skipped, maxBpm: nil)
@@ -43,31 +43,31 @@ final class WakeScreenTextTests: XCTestCase {
     }
 
     func testRunTitleSameDay() {
-        let r = record(at(6, 30), at(6, 34, 10), .awake)
+        let r = makeRecord(at(6, 30), at(6, 34, 10), .awake)
         XCTAssertEqual(WakeScreenText.runTitle(r, calendar: cal), "Fri Mar 13, 6:30 am to 6:34 am (4 min)")
     }
 
     func testRunTitleUnderAMinuteAndAcrossMidnight() {
-        XCTAssertEqual(WakeScreenText.runTitle(record(at(6, 30), at(6, 30, 42), .stopped), calendar: cal),
+        XCTAssertEqual(WakeScreenText.runTitle(makeRecord(at(6, 30), at(6, 30, 42), .stopped), calendar: cal),
                        "Fri Mar 13, 6:30 am to 6:30 am (42 s)")
-        XCTAssertEqual(WakeScreenText.runTitle(record(at(23, 58), at(0, 3, day: 14), .timeout), calendar: cal),
+        XCTAssertEqual(WakeScreenText.runTitle(makeRecord(at(23, 58), at(0, 3, day: 14), .timeout), calendar: cal),
                        "Fri Mar 13, 11:58 pm to Sat Mar 14, 12:03 am (5 min)")
         // An end before the start (clock moved) never shows a negative length.
-        XCTAssertEqual(WakeScreenText.runTitle(record(at(6, 30), at(6, 29), .clockMoved), calendar: cal),
+        XCTAssertEqual(WakeScreenText.runTitle(makeRecord(at(6, 30), at(6, 29), .clockMoved), calendar: cal),
                        "Fri Mar 13, 6:30 am to 6:29 am (0 s)")
     }
 
     func testRunDetailCounts() {
-        XCTAssertEqual(WakeScreenText.runDetail(record(at(6, 30), at(6, 34), .awake, buzz: 3, confirmed: 3, skipped: 1)),
+        XCTAssertEqual(WakeScreenText.runDetail(makeRecord(at(6, 30), at(6, 34), .awake, buzz: 3, confirmed: 3, skipped: 1)),
                        "Stopped: you were up (heart rate stayed high). 3 buzzes (3 confirmed), 1 skipped.")
-        XCTAssertEqual(WakeScreenText.runDetail(record(at(6, 30), at(6, 32), .noHR, buzz: 1, confirmed: 0)),
+        XCTAssertEqual(WakeScreenText.runDetail(makeRecord(at(6, 30), at(6, 32), .noHR, buzz: 1, confirmed: 0)),
                        "Stopped: no heart rate from the band for 2 minutes. 1 buzz (0 confirmed), 0 skipped.")
-        XCTAssertEqual(WakeScreenText.runDetail(record(at(6, 30), at(6, 30), .interrupted)),
+        XCTAssertEqual(WakeScreenText.runDetail(makeRecord(at(6, 30), at(6, 30), .interrupted)),
                        "Stopped: NOOP was closed or restarted mid-run. No buzzes, 0 skipped.")
     }
 
     func testRecentRunsNewestFirstCappedAtSeven() {
-        let rs = (0..<10).map { i in record(at(6, i), at(6, i, 30), .awake) }
+        let rs = (0..<10).map { i in makeRecord(at(6, i), at(6, i, 30), .awake) }
         let out = WakeScreenText.recentRuns(rs)
         XCTAssertEqual(out.count, 7)
         XCTAssertEqual(out.first, rs[9])

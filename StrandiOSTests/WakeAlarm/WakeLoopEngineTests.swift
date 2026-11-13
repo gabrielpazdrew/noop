@@ -11,7 +11,7 @@ final class WakeLoopEngineTests: XCTestCase {
     func sample(_ s: TimeInterval, _ bpm: Int) -> WakeEvent { .sample(WakeSample(ts: at(s), bpm: bpm)) }
 
     /// A run started at t0 with a fixed threshold and no warm-up.
-    func run(threshold: Double = 75) -> WakeRunState {
+    func makeRun(threshold: Double = 75) -> WakeRunState {
         WakeRunState.begin(started: t0, threshold: threshold, warmup: [], config: cfg)
     }
 
@@ -114,7 +114,7 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: awake
 
     func testAwakeWhenHRHeldThirtySecondsWithTenSamples() {
-        var s = run()
+        var s = makeRun()
         let acts = feed(&s, from: 0, secs: 31, bpm: 90)
         XCTAssertEqual(stops(acts), [.awake])
         XCTAssertEqual(s.stopReason, .awake)
@@ -122,7 +122,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testAwakeIsCheckedBeforeTheBuzzDecision() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 30, bpm: 90)          // 0..29: span 29 s, not yet
         XCTAssertNil(s.stopReason)
         let acts = step(&s, sample(30, 90), now: 30.5) // span 30 s → awake, no buzz with it
@@ -131,7 +131,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testNotAwakeWithFewerThanTenSamplesOverThirtySeconds() {
-        var s = run()
+        var s = makeRun()
         for t in stride(from: 0, through: 40, by: 5) {    // 9 samples spanning 40 s
             step(&s, sample(TimeInterval(t), 90), now: TimeInterval(t))
         }
@@ -142,7 +142,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testUnderThresholdSampleResetsTheRun() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 25, bpm: 90)
         step(&s, sample(25, 60), now: 25)
         feed(&s, from: 26, secs: 20, bpm: 90)
@@ -151,18 +151,18 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testAtThresholdCountsAsOver() {
-        var s = run(threshold: 75)
+        var s = makeRun(threshold: 75)
         let acts = feed(&s, from: 0, secs: 31, bpm: 75)
         XCTAssertEqual(stops(acts), [.awake])
     }
 
     func testLateFlushedSamplesStillCountOlderThanSixtyFiveIgnored() {
-        var s = run()
+        var s = makeRun()
         // A burst flushed at t = 70 carrying samples stamped 20..55 (15–50 s old, all unseen).
         for ts in 20...55 { step(&s, sample(TimeInterval(ts), 90), now: 70) }
         XCTAssertEqual(s.stopReason, .awake)
 
-        var s2 = run()
+        var s2 = makeRun()
         // Stamped 0..4 but delivered at t = 70: 66–70 s old → outside the read window.
         for ts in 0...4 { step(&s2, sample(TimeInterval(ts), 90), now: 70) }
         XCTAssertEqual(s2.overN, 0)
@@ -170,7 +170,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testLateSampleIsWalkedButNotLive() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(10, 99), now: 50)   // 40 s old: walked, not live
         XCTAssertEqual(s.lastSeenTs, at(10))
         XCTAssertEqual(s.lastNewAt, at(50))
@@ -179,7 +179,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testSamplesFromTheFutureAreIgnored() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(40, 90), now: 10)
         XCTAssertEqual(s.lastSeenTs, at(-31))
         XCTAssertEqual(s.overN, 0)
@@ -190,7 +190,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testDuplicateAndOutOfOrderSamplesIgnored() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(5, 90), now: 5)
         step(&s, sample(5, 90), now: 6)
         step(&s, sample(3, 90), now: 7)
@@ -199,12 +199,12 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testSampleFromThirtyOneSecondsBeforeStartCounts() {
-        var s = run()
+        var s = makeRun()
         // Ring replay at start: samples from -30..0 (-31 itself is the seen mark and is excluded).
         for ts in -30...0 { step(&s, sample(TimeInterval(ts), 90), now: 0) }
         XCTAssertEqual(s.stopReason, .awake)
 
-        var s2 = run()
+        var s2 = makeRun()
         step(&s2, sample(-31, 90), now: 0)
         XCTAssertEqual(s2.overN, 0)
         step(&s2, sample(-30, 90), now: 0)
@@ -214,7 +214,7 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: other stops
 
     func testTimeoutAtTenMinutesEvenWhenOnlySparseTicksArrive() {
-        var s = run()
+        var s = makeRun()
         // HR stays low and live, but events arrive only every 100 s; then they stall for minutes.
         for t in stride(from: 0, through: 500, by: 100) { step(&s, sample(TimeInterval(t), 55), now: TimeInterval(t)) }
         XCTAssertNil(s.stopReason)
@@ -226,14 +226,14 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testTimeoutWhenHRStaysLowAndLive() {
-        var s = run()
+        var s = makeRun()
         let acts = feed(&s, from: 0, secs: 700, bpm: 55)
         XCTAssertEqual(stops(acts), [.timeout])
         XCTAssertEqual(s.stopReason, .timeout)
     }
 
     func testNoHRAfterTwoMinutesOfTicksWithoutSamples() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         for t in stride(from: 0, through: 130, by: 5) {
             all += step(&s, .tick, now: TimeInterval(t))
@@ -244,7 +244,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testStaleSamplesCountAsNoHR() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         // Every sample arrives 40 s old: walked once, never live.
         for t in stride(from: 40, through: 200, by: 2) {
@@ -257,7 +257,7 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: boundaries
 
     func testCapIsExactlySixHundredSeconds() {
-        var s = run()
+        var s = makeRun()
         for t in stride(from: 0, through: 500, by: 100) { step(&s, sample(TimeInterval(t), 55), now: TimeInterval(t)) }
         step(&s, sample(599, 55), now: 599.5)
         XCTAssertNil(s.stopReason)
@@ -265,14 +265,14 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testNoHRLimitIsExactlyOneTwentySeconds() {
-        var s = run()
+        var s = makeRun()
         XCTAssertFalse(stops(step(&s, .tick, now: 119.5)).contains(.noHR))
         XCTAssertNil(s.stopReason)
         XCTAssertEqual(step(&s, .tick, now: 120), [.stop(.noHR)])
     }
 
     func testLiveWindowIncludesExactlyThirtyFiveSeconds() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(10, 60), now: 45)          // exactly 35 s old: live
         XCTAssertEqual(s.lastLiveAt, at(45))
         XCTAssertEqual(s.maxBpm, 60)
@@ -283,11 +283,11 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testLookBackIncludesExactlySixtyFiveSeconds() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(5, 90), now: 70)           // exactly 65 s old: walked
         XCTAssertEqual(s.lastSeenTs, at(5))
         XCTAssertEqual(s.overN, 1)
-        var s2 = run()
+        var s2 = makeRun()
         step(&s2, sample(5, 90), now: 70.5)        // 65.5 s old: ignored
         XCTAssertEqual(s2.lastSeenTs, at(-31))
         XCTAssertEqual(s2.overN, 0)
@@ -296,7 +296,7 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: clock jumps
 
     func testBackwardClockJumpStopsTheRunAtOnce() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 10, bpm: 55)
         let acts = step(&s, sample(-3600, 55), now: -3600)
         XCTAssertEqual(acts, [.stop(.clockMoved)])
@@ -306,12 +306,12 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testBackwardJumpOnATickStopsToo() {
-        var s = run()
+        var s = makeRun()
         XCTAssertEqual(step(&s, .tick, now: -1), [.stop(.clockMoved)])
     }
 
     func testBackwardStepMidRunPastToleranceStops() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 300, bpm: 55)
         // Back 200 s: still after the start, but the run would otherwise get 200 s more than 10 minutes.
         XCTAssertEqual(step(&s, .tick, now: 99), [.stop(.clockMoved)])
@@ -319,7 +319,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testBackwardStepWithinToleranceIsTolerated() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 20, bpm: 55)
         XCTAssertEqual(stops(step(&s, .tick, now: 14)), [], "5 s back is a stamping jitter, not a clock change")
         XCTAssertNil(s.stopReason)
@@ -327,7 +327,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testToleranceMeasuredFromNewestNowNotLast() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 30, bpm: 55)            // newest now = 29
         _ = step(&s, .tick, now: 26)                    // 3 s back: tolerated
         XCTAssertEqual(stops(step(&s, .tick, now: 23.5)), [.clockMoved], "5.5 s behind 29, though only 2.5 s behind 26")
@@ -336,14 +336,14 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: buzz gate
 
     func testFirstEventBuzzesWhenLinkReady() {
-        var s = run()
+        var s = makeRun()
         XCTAssertEqual(step(&s, .tick, now: 0), [.buzz])
         XCTAssertEqual(s.buzzCount, 1)
         XCTAssertEqual(s.lastBuzzAt, t0)
     }
 
     func testBuzzPausesWhileStreamStalled() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 5, bpm: 55)          // newest sample at t = 4
         var all: [WakeAction] = []
         for t in stride(from: 26, through: 40, by: 2) { all += step(&s, .tick, now: TimeInterval(t)) }
@@ -354,7 +354,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testBuzzResumesWhenStreamReturns() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 5, bpm: 55)
         let paused = step(&s, .tick, now: 30)
         XCTAssertEqual(buzzes(paused), 0)
@@ -363,14 +363,14 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testStallIsStrictlyMoreThanTwentySeconds() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(0, 55), now: 0)
         XCTAssertEqual(step(&s, .tick, now: 20), [.buzz])
         XCTAssertEqual(skips(step(&s, .tick, now: 22.5)).count, 1)
     }
 
     func testNeverMoreThanOneBuzzDecisionPerTwoSeconds() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         var times: [Date] = []
         // 20 events a second for 20 seconds, all with fresh samples.
@@ -387,14 +387,14 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testSkippedBuzzAlsoRespectsTheSpacing() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         for i in 0..<40 { all += step(&s, .tick, now: 25 + Double(i) * 0.1) }   // stalled, 4 s of ticks
         XCTAssertEqual(skips(all).count, 2)
     }
 
     func testLinkNotReadySkipsAndIsNeverAFailure() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         for t in stride(from: 0, through: 20, by: 2) {
             all += step(&s, sample(TimeInterval(t), 55), now: TimeInterval(t), link: false)
@@ -407,7 +407,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testThreeFailedWritesStopBuzzFailed() {
-        var s = run()
+        var s = makeRun()
         var all: [WakeAction] = []
         for k in 0..<3 {
             let t = TimeInterval(k * 2)
@@ -420,7 +420,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testConfirmedBuzzesCountedSeparatelyFromRequested() {
-        var s = run()
+        var s = makeRun()
         let results = [true, false, true]
         for (k, ok) in results.enumerated() {
             let t = TimeInterval(k * 2)
@@ -433,7 +433,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testASuccessInBetweenResetsTheFailureCount() {
-        var s = run()
+        var s = makeRun()
         let results = [false, false, true, false, false]
         for (k, ok) in results.enumerated() {
             let t = TimeInterval(k * 2)
@@ -445,7 +445,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testBuzzResultNeverItselfBuzzes() {
-        var s = run()
+        var s = makeRun()
         step(&s, sample(0, 55), now: 0)
         let acts = step(&s, .buzzResult(ok: true, detail: "ok"), now: 5)
         XCTAssertFalse(acts.contains(.buzz))
@@ -454,7 +454,7 @@ final class WakeLoopEngineTests: XCTestCase {
     // MARK: no re-arm
 
     func testNoActionOfAnyKindAfterAStop() {
-        var s = run()
+        var s = makeRun()
         feed(&s, from: 0, secs: 31, bpm: 90)
         XCTAssertEqual(s.stopReason, .awake)
         let before = s
@@ -466,7 +466,7 @@ final class WakeLoopEngineTests: XCTestCase {
     }
 
     func testExplicitStopIsFinalAndOnlyOnce() {
-        var s = run()
+        var s = makeRun()
         XCTAssertEqual(WakeLoopEngine.stop(&s, reason: .stopped), [.stop(.stopped)])
         XCTAssertEqual(s.stopReason, .stopped)
         XCTAssertEqual(WakeLoopEngine.stop(&s, reason: .interrupted), [])

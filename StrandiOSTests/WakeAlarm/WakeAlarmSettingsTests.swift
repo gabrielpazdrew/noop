@@ -108,7 +108,7 @@ final class WakeAlarmSettingsTests: XCTestCase {
 
     // MARK: run record
 
-    func record(_ k: Int) -> WakeRunRecord {
+    func makeRecord(_ k: Int) -> WakeRunRecord {
         WakeRunRecord(started: Date(timeIntervalSince1970: 1_700_000_000 + Double(k) * 86_400),
                       ended: Date(timeIntervalSince1970: 1_700_000_300 + Double(k) * 86_400),
                       stopReason: .awake, thresholdSource: "fallback",
@@ -124,18 +124,18 @@ final class WakeAlarmSettingsTests: XCTestCase {
         log.append(r)
         let again = WakeRunLog(defaults: defaults).records
         XCTAssertEqual(again, [r])
-        let noMax = record(2)
+        let noMax = makeRecord(2)
         log.append(noMax)
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r, noMax])
     }
 
     func testRunLogKeepsTheLastFourteen() {
         let log = WakeRunLog(defaults: defaults)
-        for k in 0..<20 { log.append(record(k)) }
+        for k in 0..<20 { log.append(makeRecord(k)) }
         let kept = WakeRunLog(defaults: defaults).records
         XCTAssertEqual(kept.count, 14)
-        XCTAssertEqual(kept.first, record(6))
-        XCTAssertEqual(kept.last, record(19))
+        XCTAssertEqual(kept.first, makeRecord(6))
+        XCTAssertEqual(kept.last, makeRecord(19))
     }
 
     func testRunLogEmptyAndCorruptReadAsEmpty() {
@@ -146,16 +146,16 @@ final class WakeAlarmSettingsTests: XCTestCase {
 
     func testOneUndecodableRecordDoesNotDropTheHistory() throws {
         let log = WakeRunLog(defaults: defaults)
-        log.append(record(1))
-        log.append(record(3))
+        log.append(makeRecord(1))
+        log.append(makeRecord(3))
         let data = try XCTUnwrap(defaults.data(forKey: "wake.runs"))
         var list = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [Any])
         list.insert(["started": "garbage"], at: 1)
         list.append(42)
         defaults.set(try JSONSerialization.data(withJSONObject: list), forKey: "wake.runs")
-        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [record(1), record(3)])
-        log.append(record(5))
-        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [record(1), record(3), record(5)])
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [makeRecord(1), makeRecord(3)])
+        log.append(makeRecord(5))
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [makeRecord(1), makeRecord(3), makeRecord(5)])
     }
 
     func testActiveRunMarkerPersistsAndClears() {
