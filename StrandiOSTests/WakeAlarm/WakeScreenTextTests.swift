@@ -34,7 +34,8 @@ final class WakeScreenTextTests: XCTestCase {
 
     func testEveryStopReasonHasPlainWords() {
         XCTAssertEqual(WakeScreenText.stopReason(.awake), "you were up (heart rate stayed high)")
-        XCTAssertEqual(WakeScreenText.stopReason(.timeout), "the 10-minute limit")
+        XCTAssertEqual(WakeScreenText.stopReason(.timeout), "the 45-minute watch window ended")
+        XCTAssertEqual(WakeScreenText.stopReason(.buzzBudget), "10 minutes of buzzing in total")
         XCTAssertEqual(WakeScreenText.stopReason(.noHR), "no heart rate from the band for 2 minutes")
         XCTAssertEqual(WakeScreenText.stopReason(.buzzFailed), "the band missed 3 buzzes in a row")
         XCTAssertEqual(WakeScreenText.stopReason(.stopped), "you tapped Stop or turned the alarm off")
@@ -64,6 +65,16 @@ final class WakeScreenTextTests: XCTestCase {
                        "Stopped: no heart rate from the band for 2 minutes. 1 buzz (0 confirmed), 0 skipped.")
         XCTAssertEqual(WakeScreenText.runDetail(makeRecord(at(6, 30), at(6, 30), .interrupted)),
                        "Stopped: NOOP was closed or restarted mid-run. No buzzes, 0 skipped.")
+    }
+
+    func testRunDetailShowsTheV2LoopCountsWhenPresent() {
+        var r = makeRecord(at(6, 30), at(7, 15), .timeout, buzz: 63, confirmed: 62, skipped: 4)
+        r.quietCount = 1; r.rearmCount = 1; r.buzzingSeconds = 310
+        XCTAssertEqual(WakeScreenText.runDetail(r),
+                       "Stopped: the 45-minute watch window ended. Up 1× · back asleep 1× · buzzing 5 min · 63 buzzes (62 confirmed), 4 skipped.")
+        r.stopReason = .buzzBudget; r.quietCount = 0; r.rearmCount = 0; r.buzzingSeconds = 42
+        XCTAssertEqual(WakeScreenText.runDetail(r),
+                       "Stopped: 10 minutes of buzzing in total. Up 0× · back asleep 0× · buzzing 42 s · 63 buzzes (62 confirmed), 4 skipped.")
     }
 
     func testRecentRunsNewestFirstCappedAtSeven() {

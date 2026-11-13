@@ -33,7 +33,8 @@ enum WakeScreenText {
         let config = WakeConfig()
         switch reason {
         case .awake: return "you were up (heart rate stayed high)"
-        case .timeout: return "the \(Int(config.cap) / 60)-minute limit"
+        case .timeout: return "the \(Int(config.watchWindow) / 60)-minute watch window ended"
+        case .buzzBudget: return "\(Int(config.buzzBudget) / 60) minutes of buzzing in total"
         case .noHR: return "no heart rate from the band for \(Int(config.noHRLimit) / 60) minutes"
         case .buzzFailed: return "the band missed \(config.maxBuzzFailures) buzzes in a row"
         case .stopped: return "you tapped Stop or turned the alarm off"
@@ -55,7 +56,8 @@ enum WakeScreenText {
         return "\(start) to \(end) (\(length))"
     }
 
-    /// "Stopped: <reason>. 3 buzzes (3 confirmed), 1 skipped."
+    /// "Stopped: <reason>. Up 1× · back asleep 1× · buzzing 5 min · 63 buzzes (63 confirmed), 1 skipped."
+    /// The up / back asleep / buzzing part shows only on v2 records.
     static func runDetail(_ r: WakeRunRecord) -> String {
         let buzzes: String
         switch r.buzzCount {
@@ -63,7 +65,12 @@ enum WakeScreenText {
         case 1: buzzes = "1 buzz (\(r.confirmedBuzzCount) confirmed)"
         default: buzzes = "\(r.buzzCount) buzzes (\(r.confirmedBuzzCount) confirmed)"
         }
-        return "Stopped: \(stopReason(r.stopReason)). \(buzzes), \(r.skippedCount) skipped."
+        var loop = ""
+        if let q = r.quietCount, let a = r.rearmCount, let b = r.buzzingSeconds {
+            let buzzing = b < 60 ? "\(b) s" : "\(b / 60) min"
+            loop = "Up \(q)× · back asleep \(a)× · buzzing \(buzzing) · "
+        }
+        return "Stopped: \(stopReason(r.stopReason)). \(loop)\(buzzes), \(r.skippedCount) skipped."
     }
 
     /// The newest `shownRuns` records, newest first (`WakeRunLog.records` is oldest first).

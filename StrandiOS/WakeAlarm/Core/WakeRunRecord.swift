@@ -16,6 +16,19 @@ struct WakeRunRecord: Codable, Equatable {
     var confirmedBuzzCount: Int
     var skippedCount: Int
     var maxBpm: Int?
+    /// v2 (Nov 12, 2026). nil on v1 records and on interrupted runs (the killed process took them along).
+    /// Times the run went quiet (HR showed he was up).
+    var quietCount: Int? = nil
+    /// Times it went back to buzzing (HR showed he fell back asleep).
+    var rearmCount: Int? = nil
+    /// Seconds spent buzzing, all buzzing stretches added up.
+    var buzzingSeconds: Int? = nil
+
+    /// What a relaunch records for a run the killed process left live: nothing about it is known.
+    static func interrupted(started: Date, ended: Date) -> WakeRunRecord {
+        WakeRunRecord(started: started, ended: ended, stopReason: .interrupted, thresholdSource: "unknown",
+                      buzzCount: 0, confirmedBuzzCount: 0, skippedCount: 0, maxBpm: nil)
+    }
 }
 
 final class WakeRunLog {

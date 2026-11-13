@@ -19,7 +19,7 @@ struct WakeAlarmSettingsView: View {
 
     var body: some View {
         ScreenScaffold(title: "Wake Alarm",
-                       subtitle: "The band buzzes until your heart rate shows you're up. On by default.") {
+                       subtitle: "The band buzzes until your heart rate shows you're up, and again if you fall back asleep. On by default.") {
             settingsCard
             // Re-reads the live run and the records every few seconds while the screen is open.
             // Display only: nothing in this refresh can start a run or buzz.

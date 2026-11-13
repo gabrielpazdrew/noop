@@ -1,41 +1,69 @@
 // Fork-only (phone-hub). Foundation-only: compiled into NOOPiOS AND the NOOPiOSHubTests bundle.
 //
 // The phone wake alarm's whole decision logic, with no Bluetooth, no timers and no UI:
-// (event, clock, config, state) -> actions. A port of the Health Analysis Mac loop
-// (tools/wake_loop.py, `run_loop`), driven by events instead of a sleep loop: every heart-rate
+// (event, clock, config, state) -> actions. Driven by events, not a sleep loop: every heart-rate
 // sample and every other app wake-up is one `step`, and every step re-reads the wall clock, so the
-// 10-minute cap and the no-HR stop hold even when events stall. If events stop entirely, nothing
-// buzzes (fails safe). A stopped run never re-arms.
+// watch window, the buzz budget and the no-HR stop hold even when events stall. If events stop
+// entirely, nothing buzzes (fails safe).
+//
+// v2 (Nov 12, 2026): heart-rate LEVEL drives the run, not a one-shot "awake" stop. A run starts
+// `.buzzing`; once the AVERAGE HR over the last `upSustain` is at or above the up line it goes `.quiet`
+// (band stopped, run still watching); if the average over the last `asleepSustain` then drops to the
+// back-asleep line it buzzes again. Each mode judges only samples walked since it began, and only
+// after it has lasted its sustain. Averages, not every-sample runs: a short dip should not reset the
+// "up" count, and a 5-min mean near resting HR separates dozing off from sitting awake far better than
+// a short window. Only samples stamped at or after the start count. The run ends on the watch window, the
+// buzz budget, no HR, buzz failures, a clock change or Stop. A stopped run never re-arms.
 import Foundation
 
-/// The Mac loop's numbers (tools/wake_loop.py) as defaults.
+/// Every number the wake loop uses, in one place (the coordinator tunes them from real nights).
 struct WakeConfig: Equatable {
-    /// bpm added to the resting HR (or the recent median) to get the "awake" threshold.
-    var margin: Double = 15
-    /// Threshold when there is neither a resting HR nor any recent HR.
+    /// bpm added to the resting HR (or the recent median) to get the up line.
+    var upMargin: Double = 15
+    /// bpm added to the resting HR to get the back-asleep line (median/fallback: up line minus the gap).
+    var asleepMargin: Double = 6
+    /// A resting HR outside this range is treated as missing (a misread night, e.g. around a DST change, can report one far too high).
+    var restingMin: Int = 35
+    var restingMax: Int = 65
+    /// Up line when there is neither a resting HR nor any recent HR.
     var fallbackThreshold: Double = 70
-    /// Ceiling for a median-derived threshold (a median taken while already awake is unreachable + 15).
+    /// Ceiling for a median-derived up line (a median taken while already awake is unreachable + 15).
     var medianCap: Double = 90
     /// How far back the median fallback looks.
     var medianWindow: TimeInterval = 1200
-    /// HR must stay at or above the threshold for this long to count as awake...
-    var sustain: TimeInterval = 30
-    /// ...with at least this many samples in the run.
-    var minOverSamples: Int = 10
+    /// Going quiet: the mean of the samples in the last this-many seconds (by sample time) is at or above
+    /// the up line, and buzzing has lasted at least this long...
+    var upSustain: TimeInterval = 120
+    /// ...with at least this many samples in that window (half its seconds).
+    var minOverSamples: Int = 60
+    /// Buzzing again: the mean over the last this-many seconds is at or below the back-asleep line, and
+    /// quiet has lasted at least this long...
+    var asleepSustain: TimeInterval = 300
+    /// ...with at least this many samples in that window.
+    var minUnderSamples: Int = 150
     /// A sample older than this is not "live".
     var fresh: TimeInterval = 35
+    /// A sample older than this on arrival is not walked at all (a late back-fill burst inside it still counts).
+    var readWindow: TimeInterval = 65
+    /// Ring samples from this long before the start seed `maxBpm` (they are never walked).
+    var warmupWindow: TimeInterval = 31
     /// No new HR sample for longer than this pauses the buzzing (night 1: buzzing starved the HR stream).
     var buzzStall: TimeInterval = 20
-    /// No live HR for this long stops the run.
+    /// No live HR for this long stops the run, buzzing or quiet.
     var noHRLimit: TimeInterval = 120
-    /// Total run length.
-    var cap: TimeInterval = 600
+    /// Total run length, from the start.
+    var watchWindow: TimeInterval = 2700
+    /// After going quiet, stop-haptics is sent once more on the first event at least this long after
+    /// (the first one is an unconfirmed write: iOS may drop it, or it may overtake a queued buzz).
+    var quietResendDelay: TimeInterval = 3
+    /// Total time spent buzzing (all buzzing stretches added up) that ends the run.
+    var buzzBudget: TimeInterval = 600
     /// Consecutive failed buzz writes that stop the run.
     var maxBuzzFailures: Int = 3
     /// At most one buzz decision (buzz or skip) per this many seconds.
     var buzzSpacing: TimeInterval = 2
     /// A step whose clock is more than this behind the newest clock seen in the run stops it (`clockMoved`):
-    /// a clock set back mid-run would otherwise stretch the 10-minute cap in real time.
+    /// a clock set back mid-run would otherwise stretch the watch window in real time.
     var clockBackTolerance: TimeInterval = 5
 }
 
@@ -48,6 +76,8 @@ enum WakeThresholdSource: Equatable {
     case restingHR(Int)
     case median(bpm: Double, n: Int, capped: Bool)
     case fallback
+    /// A resting HR failed the sanity range; `then` is what was used instead (median or fallback).
+    indirect case rejected(restingHR: Int, then: WakeThresholdSource)
 
     /// Shaped like the Mac loop's source text, for the strap log and the run record.
     var logDescription: String {
@@ -59,14 +89,30 @@ enum WakeThresholdSource: Equatable {
             return "median_last_\(minutes)min=\(String(format: "%.0f", bpm))(n=\(n))\(capped ? " capped" : "")"
         case .fallback:
             return "fallback"
+        case .rejected(let r, let then):
+            return "\(then.logDescription) (resting_hr \(r) rejected)"
         }
     }
 }
 
 enum WakeStopReason: String, Codable, Equatable {
-    case awake, timeout, noHR, buzzFailed, stopped, interrupted
+    /// v1 only (HR held high for 30 s ended the run); kept so old records still decode. v2 never ends on it.
+    case awake
+    /// The watch window ran out.
+    case timeout
+    case noHR, buzzFailed, stopped, interrupted
     /// The wall clock went back before the run's start: every age and limit is then meaningless.
     case clockMoved
+    /// The run spent `buzzBudget` seconds buzzing in total.
+    case buzzBudget
+}
+
+/// Which half of the loop a live run is in.
+enum WakeMode: String, Equatable {
+    /// Buzzing (subject to spacing, stall and link checks). A run starts here.
+    case buzzing
+    /// HR showed he is up: the band is stopped and nothing buzzes until HR drops back to the asleep line.
+    case quiet
 }
 
 enum WakeEvent: Equatable {
@@ -82,19 +128,26 @@ enum WakeAction: Equatable {
     case buzz
     case skipBuzz(reason: String)
     case log(String)
+    /// Stop the band's vibration now WITHOUT ending the run (going quiet).
+    case stopHaptics
     case stop(WakeStopReason)
 }
 
 /// One run's state. Value type: the runner owns the only copy.
 struct WakeRunState: Equatable {
     var started: Date
-    var threshold: Double
+    /// At or above: counts toward "up" (going quiet).
+    var upLine: Double
+    /// At or below: counts toward "back asleep" (buzzing again).
+    var asleepLine: Double
+    var mode: WakeMode
     /// Newest sample timestamp already walked (dedup mark).
     var lastSeenTs: Date
-    /// First / newest sample of the current over-threshold run; nil when there is none.
-    var overSince: Date?
-    var overLast: Date?
-    var overN: Int
+    /// Wall clock the current mode began (run start, last quiet, last re-arm).
+    var modeSince: Date
+    /// Samples walked since the current mode began, oldest first, trimmed to that mode's sustain window
+    /// (by sample time). Bounded: at most one sustain window of samples.
+    var window: [WakeSample]
     /// Wall clock of the last step that walked a not-yet-seen sample (the buzz gate reads it).
     var lastNewAt: Date
     /// Wall clock of the last step that saw a live sample (the no-HR stop reads it).
@@ -103,6 +156,15 @@ struct WakeRunState: Equatable {
     var lastBuzzAt: Date
     /// The newest wall clock any step of this run has seen (the backwards-step check reads it).
     var newestNow: Date
+    /// Seconds spent buzzing in finished buzzing stretches.
+    var buzzingDone: TimeInterval
+    /// Wall clock the current buzzing stretch began; nil while quiet.
+    var buzzingSince: Date?
+    /// The one stop-haptics re-send after going quiet is still owed (cleared when sent or on re-arm).
+    var quietResendPending: Bool
+    /// Times the run went quiet (HR showed he was up) / went back to buzzing (HR showed he fell back asleep).
+    var quietCount: Int
+    var rearmCount: Int
     /// Buzzes requested (writes handed to the runner).
     var buzzCount: Int
     /// Buzzes the runner reported as written OK (`buzzResult(ok: true)`).
@@ -112,20 +174,33 @@ struct WakeRunState: Equatable {
     var maxBpm: Int?
     var stopReason: WakeStopReason?
 
-    /// Start values as `run_loop`: samples from the `sustain + 1` s before the trigger can still be
-    /// walked (the runner replays them from its ring), and `maxBpm` starts at the warm-up maximum.
-    static func begin(started: Date, threshold: Double, warmup: [WakeSample], config: WakeConfig) -> WakeRunState {
+    /// A run starts buzzing. Only samples stamped at or after `started` are walked; `maxBpm` starts at
+    /// the warm-up maximum (ring samples from just before the start, never walked).
+    static func begin(started: Date, upLine: Double, asleepLine: Double, warmup: [WakeSample],
+                      config: WakeConfig) -> WakeRunState {
         WakeRunState(started: started,
-                     threshold: threshold,
-                     lastSeenTs: started.addingTimeInterval(-config.sustain - 1),
-                     overSince: nil, overLast: nil, overN: 0,
+                     upLine: upLine,
+                     asleepLine: asleepLine,
+                     mode: .buzzing,
+                     lastSeenTs: .distantPast,
+                     modeSince: started,
+                     window: [],
                      lastNewAt: started,
                      lastLiveAt: started,
                      lastBuzzAt: .distantPast,
                      newestNow: started,
+                     buzzingDone: 0,
+                     buzzingSince: started,
+                     quietResendPending: false,
+                     quietCount: 0, rearmCount: 0,
                      buzzCount: 0, confirmedBuzzCount: 0, skippedCount: 0, consecutiveFailures: 0,
                      maxBpm: warmup.map(\.bpm).max(),
                      stopReason: nil)
+    }
+
+    /// Total seconds spent buzzing as of `now` (the current stretch included).
+    func buzzingSeconds(at now: Date) -> TimeInterval {
+        buzzingDone + (buzzingSince.map { max(0, now.timeIntervalSince($0)) } ?? 0)
     }
 }
 
@@ -144,19 +219,53 @@ enum WakeLoopEngine {
         return best?.hr
     }
 
-    /// Resting HR + margin (no cap); else median of recent HR + margin, capped; else the flat fallback.
+    /// The up line: resting HR + `upMargin` (no cap); else median of recent HR + `upMargin`, capped;
+    /// else the flat fallback.
+    /// A resting HR outside `restingMin...restingMax` is rejected (treated as missing; the source says so).
     static func pickThreshold(restingHR: Int?, recent: [WakeSample],
                               config: WakeConfig) -> (Double, WakeThresholdSource) {
-        if let r = restingHR {
-            return (Double(r) + config.margin, .restingHR(r))
+        if let r = acceptedRestingHR(restingHR, config: config) {
+            return (Double(r) + config.upMargin, .restingHR(r))
         }
+        let (line, source) = pickWithoutRestingHR(recent: recent, config: config)
+        if let r = restingHR { return (line, .rejected(restingHR: r, then: source)) }
+        return (line, source)
+    }
+
+    /// The resting HR if it passes the sanity range, else nil.
+    static func acceptedRestingHR(_ restingHR: Int?, config: WakeConfig) -> Int? {
+        guard let r = restingHR, r >= config.restingMin, r <= config.restingMax else { return nil }
+        return r
+    }
+
+    private static func pickWithoutRestingHR(recent: [WakeSample],
+                                             config: WakeConfig) -> (Double, WakeThresholdSource) {
         if !recent.isEmpty {
             let med = median(recent.map(\.bpm))
-            let raw = med + config.margin
+            let raw = med + config.upMargin
             let thr = min(raw, config.medianCap)
             return (thr, .median(bpm: med, n: recent.count, capped: thr < raw))
         }
         return (config.fallbackThreshold, .fallback)
+    }
+
+    /// The back-asleep line. Resting HR: resting + `asleepMargin`. Median / fallback: the up line minus the
+    /// gap between the margins (the same gap, applied to whatever the up line came to, cap included).
+    static func asleepLine(upLine: Double, source: WakeThresholdSource, config: WakeConfig) -> Double {
+        switch source {
+        case .restingHR(let r): return Double(r) + config.asleepMargin
+        case .median, .fallback, .rejected: return upLine - (config.upMargin - config.asleepMargin)
+        }
+    }
+
+    /// "2-min" for whole minutes, else "90-s" (log text built from config numbers).
+    static func span(_ secs: TimeInterval) -> String {
+        let n = Int(secs)
+        return n % 60 == 0 ? "\(n / 60)-min" : "\(n)-s"
+    }
+
+    static func mean(_ samples: [WakeSample]) -> Double {
+        Double(samples.reduce(0) { $0 + $1.bpm }) / Double(samples.count)
     }
 
     /// Python's `statistics.median`: the mean of the two middle values when the count is even.
@@ -183,28 +292,45 @@ enum WakeLoopEngine {
         guard state.stopReason == nil else { return [] }
 
         // 2. The clock first, on every event. A clock that went back before the start stops the run:
-        //    otherwise the cap and every age would be measured from the wrong side.
+        //    otherwise the watch window and every age would be measured from the wrong side.
         //    So does a step more than the tolerance behind the newest clock seen (set back mid-run).
         if now < state.started || state.newestNow.timeIntervalSince(now) > config.clockBackTolerance {
             return stop(&state, reason: .clockMoved)
         }
         if now > state.newestNow { state.newestNow = now }
-        if now.timeIntervalSince(state.started) >= config.cap {
+        if now.timeIntervalSince(state.started) >= config.watchWindow {
             return stop(&state, reason: .timeout)
         }
+        if state.buzzingSeconds(at: now) >= config.buzzBudget {
+            return stop(&state, reason: .buzzBudget)
+        }
+        // Either mode: a quiet run with no HR can't tell whether he fell back asleep.
         if now.timeIntervalSince(state.lastLiveAt) >= config.noHRLimit {
             return stop(&state, reason: .noHR)
         }
 
         var actions: [WakeAction] = []
 
+        // The one stop-haptics re-send, on any event once the delay has passed. Unconfirmed, like the first.
+        if state.mode == .quiet, state.quietResendPending,
+           now.timeIntervalSince(state.modeSince) >= config.quietResendDelay {
+            state.quietResendPending = false
+            actions.append(.stopHaptics)
+        }
+
         switch event {
         case .buzzResult(let ok, let detail):
             // 5. Only the failure count; a result never itself leads to a buzz.
+            if state.mode == .quiet {
+                // In-flight results of buzzes sent just before quiet: a late success still counts as
+                // confirmed, a late failure is ignored (it must not end a quiet run as buzzFailed).
+                if ok { state.confirmedBuzzCount += 1 }
+                return actions
+            }
             if ok {
                 state.confirmedBuzzCount += 1
                 state.consecutiveFailures = 0
-                return []
+                return actions
             }
             state.consecutiveFailures += 1
             actions.append(.log("buzz FAILED (\(state.consecutiveFailures)/\(config.maxBuzzFailures)): \(detail)"))
@@ -214,11 +340,12 @@ enum WakeLoopEngine {
             return actions
 
         case .sample(let s):
-            // 3. Walk the sample, then judge "awake" before any buzz decision.
+            // 3. Walk the sample, then judge the mode change before any buzz decision.
             let age = now.timeIntervalSince(s.ts)
-            let walk = s.ts <= now                         // never walk ahead of the clock
+            let walk = s.ts >= state.started               // only this run's samples
+                && s.ts <= now                             // never walk ahead of the clock
                 && s.ts > state.lastSeenTs                 // dedup
-                && age <= config.sustain + config.fresh    // the Mac's read window (65 s)
+                && age <= config.readWindow                // a late back-fill burst still counts
             if walk {
                 if age <= config.fresh {
                     state.lastLiveAt = now
@@ -226,17 +353,29 @@ enum WakeLoopEngine {
                 }
                 state.lastSeenTs = s.ts
                 state.lastNewAt = now
-                if Double(s.bpm) >= state.threshold {
-                    if state.overSince == nil { state.overSince = s.ts; state.overN = 0 }
-                    state.overLast = s.ts
-                    state.overN += 1
-                } else {
-                    state.overSince = nil; state.overLast = nil; state.overN = 0
-                }
-                if let since = state.overSince, let last = state.overLast,
-                   last.timeIntervalSince(since) >= config.sustain,
-                   state.overN >= config.minOverSamples {
-                    return stop(&state, reason: .awake)
+                // Each mode judges only samples walked since it began (a late sample stamped before
+                // the mode change belongs to the old mode and is left out).
+                if s.ts >= state.modeSince {
+                    let sustain = state.mode == .buzzing ? config.upSustain : config.asleepSustain
+                    state.window.append(s)
+                    let oldest = s.ts.addingTimeInterval(-sustain)
+                    if let keep = state.window.firstIndex(where: { $0.ts >= oldest }) {
+                        state.window.removeFirst(keep)
+                    }
+                    if now.timeIntervalSince(state.modeSince) >= sustain {
+                        let avg = mean(state.window)
+                        switch state.mode {
+                        case .buzzing:
+                            if state.window.count >= config.minOverSamples, avg >= state.upLine {
+                                goQuiet(&state, now: now, config: config, actions: &actions)
+                                return actions
+                            }
+                        case .quiet:
+                            if state.window.count >= config.minUnderSamples, avg <= state.asleepLine {
+                                rearm(&state, now: now, config: config, actions: &actions)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -244,7 +383,8 @@ enum WakeLoopEngine {
             break
         }
 
-        // 4. Buzz decision, at most one per spacing.
+        // 4. Buzz decision, at most one per spacing, and never while quiet.
+        guard state.mode == .buzzing else { return actions }
         guard now.timeIntervalSince(state.lastBuzzAt) >= config.buzzSpacing else { return actions }
         state.lastBuzzAt = now
         let sinceNew = now.timeIntervalSince(state.lastNewAt)
@@ -260,5 +400,33 @@ enum WakeLoopEngine {
             actions.append(.buzz)
         }
         return actions
+    }
+
+    /// Buzzing → quiet: the band is told to stop, the run keeps watching for a fall back asleep.
+    private static func goQuiet(_ state: inout WakeRunState, now: Date, config: WakeConfig,
+                                actions: inout [WakeAction]) {
+        state.buzzingDone = state.buzzingSeconds(at: now)
+        state.buzzingSince = nil
+        state.modeSince = now
+        state.window = []
+        state.quietResendPending = true
+        state.mode = .quiet
+        state.quietCount += 1
+        let secs = max(0, Int(now.timeIntervalSince(state.started)))
+        actions.append(.stopHaptics)
+        actions.append(.log("quiet (\(span(config.upSustain)) average ≥ \(String(format: "%.0f", state.upLine)) bpm) after \(secs)s, \(state.buzzCount) buzz(es)"))
+    }
+
+    /// Quiet → buzzing: HR held at or below the back-asleep line. The next eligible event buzzes.
+    private static func rearm(_ state: inout WakeRunState, now: Date, config: WakeConfig,
+                              actions: inout [WakeAction]) {
+        state.mode = .buzzing
+        state.buzzingSince = now
+        state.modeSince = now
+        state.window = []
+        state.quietResendPending = false
+        state.consecutiveFailures = 0
+        state.rearmCount += 1
+        actions.append(.log("back asleep? \(span(config.asleepSustain)) average ≤ \(String(format: "%.0f", state.asleepLine)) bpm — buzzing again"))
     }
 }

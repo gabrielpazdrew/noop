@@ -1,7 +1,7 @@
 // Fork-only (phone-hub). Foundation-only: compiled into NOOPiOS AND the NOOPiOSHubTests bundle.
 //
 // The wake runner's in-memory heart-rate ring: the last 20 minutes of readable HR samples, stamped on
-// arrival. It feeds the threshold's median fallback and the look-back replay at the start of a run.
+// arrival. It feeds the up line's median fallback and the run's max-HR warm-up (v2: never replayed into a run).
 // Never persisted.
 import Foundation
 

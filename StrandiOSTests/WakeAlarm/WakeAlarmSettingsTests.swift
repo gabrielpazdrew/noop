@@ -127,6 +127,41 @@ final class WakeAlarmSettingsTests: XCTestCase {
         let noMax = makeRecord(2)
         log.append(noMax)
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r, noMax])
+        var v2 = makeRecord(3)
+        v2.stopReason = .buzzBudget; v2.quietCount = 2; v2.rearmCount = 1; v2.buzzingSeconds = 600
+        log.append(v2)
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r, noMax, v2])
+    }
+
+    func testInterruptedRecordCarriesNilForTheLoopCounts() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let r = WakeRunRecord.interrupted(started: start, ended: start.addingTimeInterval(400))
+        XCTAssertEqual(r.stopReason, .interrupted)
+        XCTAssertEqual(r.thresholdSource, "unknown")
+        XCTAssertEqual(r.buzzCount, 0)
+        XCTAssertNil(r.maxBpm)
+        XCTAssertNil(r.quietCount)
+        XCTAssertNil(r.rearmCount)
+        XCTAssertNil(r.buzzingSeconds)
+        let log = WakeRunLog(defaults: defaults)
+        log.append(r)
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r])
+    }
+
+    func testV1RecordWithoutTheLoopCountsStillDecodes() throws {
+        // A record written by v1 (no quietCount / rearmCount / buzzingSeconds, stop reason "awake").
+        let old: [[String: Any]] = [[
+            "started": 700_000_000.0, "ended": 700_000_095.0, "stopReason": "awake",
+            "thresholdSource": "resting_hr=49", "buzzCount": 1, "confirmedBuzzCount": 1, "skippedCount": 0,
+        ]]
+        defaults.set(try JSONSerialization.data(withJSONObject: old), forKey: "wake.runs")
+        let got = WakeRunLog(defaults: defaults).records
+        XCTAssertEqual(got.count, 1)
+        XCTAssertEqual(got.first?.stopReason, .awake)
+        XCTAssertNil(got.first?.quietCount)
+        XCTAssertNil(got.first?.rearmCount)
+        XCTAssertNil(got.first?.buzzingSeconds)
+        XCTAssertNil(got.first?.maxBpm)
     }
 
     func testRunLogKeepsTheLastFourteen() {

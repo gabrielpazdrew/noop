@@ -60,9 +60,7 @@ final class WakeAlarmRunner {
         }
         let log = runLog
         if let started = log.activeRunStartedAt {
-            log.append(WakeRunRecord(started: started, ended: now, stopReason: .interrupted,
-                                     thresholdSource: "unknown", buzzCount: 0, confirmedBuzzCount: 0,
-                                     skippedCount: 0, maxBpm: nil))
+            log.append(WakeRunRecord.interrupted(started: started, ended: now))
             log.activeRunStartedAt = nil
             strapLog(WakeLogText.interrupted)
             interruptedClearPending = true
@@ -80,7 +78,7 @@ final class WakeAlarmRunner {
 
         // A run whose events died stays in memory until something steps it. Probe a copy with the link
         // reported down (so the probe can never ask for a buzz); only a stop it reaches is carried out, so a
-        // stale run (timeout / noHR / clockMoved) records itself before the gate looks.
+        // stale run (timeout / buzzBudget / noHR / clockMoved) records itself before the gate looks.
         if var probe = run {
             let actions = WakeLoopEngine.step(&probe, .tick, now: now, linkReady: false, config: config)
             if let reason = probe.stopReason, actions.contains(.stop(reason)) {
@@ -94,7 +92,7 @@ final class WakeAlarmRunner {
             decision = .ignoredLiveRun
         } else {
             decision = WakeTriggerGate.decide(settings: s, activeRunStartedAt: runLog.activeRunStartedAt,
-                                              now: now, cap: config.cap)
+                                              now: now, cap: config.watchWindow)
         }
         if decision != .start {
             // Log the skip if the model is (or soon is) there; a skip never waits on anything else.
@@ -117,7 +115,7 @@ final class WakeAlarmRunner {
         guard !Task.isCancelled else { return .notReady }
         let resting = WakeLoopEngine.newestRestingHR(model.repo.days.map { (day: $0.day, restingHr: $0.restingHr) })
         var stored: [WakeSample] = []
-        if resting == nil {
+        if WakeLoopEngine.acceptedRestingHR(resting, config: config) == nil {   // missing or rejected: median fallback
             let to = Date()
             let rows = await model.repo.hrSamples(from: Int(to.addingTimeInterval(-config.medianWindow).timeIntervalSince1970),
                                                   to: Int(to.timeIntervalSince1970))
@@ -129,28 +127,28 @@ final class WakeAlarmRunner {
         var again = settings
         again.clearSkipIfPassed(now: started, calendar: .current)
         let recheck = WakeTriggerGate.decide(settings: again, activeRunStartedAt: runLog.activeRunStartedAt,
-                                             now: started, cap: config.cap)
+                                             now: started, cap: config.watchWindow)
         if recheck != .start {
             logRefusal(recheck, settings: again)
             return .decided(recheck)
         }
         let recent = WakeSampleRing.mergeRecent(ring: ring.samples, stored: stored, now: started,
                                                 window: config.medianWindow)
-        let (threshold, source) = WakeLoopEngine.pickThreshold(restingHR: resting, recent: recent, config: config)
-        // The look-back: ring samples from the `sustain + 1` s before the start, replayed as events below.
-        let lookBack = ring.samples(after: started.addingTimeInterval(-config.sustain - 1), through: started)
+        let (upLine, source) = WakeLoopEngine.pickThreshold(restingHR: resting, recent: recent, config: config)
+        let asleepLine = WakeLoopEngine.asleepLine(upLine: upLine, source: source, config: config)
+        // v2: no look-back replay (it ended a run started while awake after one buzz). The ring's last
+        // seconds only seed the run's max HR; the engine walks samples stamped at or after the start.
+        let warmup = ring.samples(after: started.addingTimeInterval(-config.warmupWindow), through: started)
 
-        run = WakeRunState.begin(started: started, threshold: threshold, warmup: lookBack, config: config)
+        run = WakeRunState.begin(started: started, upLine: upLine, asleepLine: asleepLine,
+                                 warmup: warmup, config: config)
         runSource = source
         ledger = WakeBuzzLedger()
         runLog.activeRunStartedAt = started
         installRunObservers()
         beginBackgroundTask()
-        strapLog(WakeLogText.start(threshold: threshold, source: source,
+        strapLog(WakeLogText.start(upLine: upLine, asleepLine: asleepLine, source: source,
                                    bandAlarmOn: model.behavior.smartAlarmEnabled))
-        for sample in lookBack where run != nil {
-            step(.sample(sample), now: Date())
-        }
         return .decided(.start)
     }
 
@@ -262,6 +260,9 @@ final class WakeAlarmRunner {
                 strapLog(WakeLogText.skipped(reason))
             case .log(let line):
                 strapLog(WakeLogText.engine(line))
+            case .stopHaptics:
+                // Going quiet: the band stops vibrating, the run goes on watching. Never a buzz.
+                AppModel.shared?.stopHaptics()
             case .stop(let reason):
                 finish(reason: reason, now: now)
             }
@@ -280,7 +281,9 @@ final class WakeAlarmRunner {
         log.append(WakeRunRecord(started: state.started, ended: now, stopReason: reason,
                                  thresholdSource: runSource.logDescription,
                                  buzzCount: state.buzzCount, confirmedBuzzCount: state.confirmedBuzzCount,
-                                 skippedCount: state.skippedCount, maxBpm: state.maxBpm))
+                                 skippedCount: state.skippedCount, maxBpm: state.maxBpm,
+                                 quietCount: state.quietCount, rearmCount: state.rearmCount,
+                                 buzzingSeconds: Int(state.buzzingSeconds(at: max(now, state.started)))))
         log.activeRunStartedAt = nil
         strapLog(WakeLogText.stop(state, reason: reason, now: now))
         endBackgroundTask()
