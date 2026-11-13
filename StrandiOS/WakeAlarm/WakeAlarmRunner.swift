@@ -4,7 +4,9 @@
 // Shortcuts action calls), feeds it every heart-rate sample and every other Bluetooth wake-up, carries
 // out the engine's actions, and cleans up on every stop. Every decision lives in Core/ (engine, gate,
 // ledger); this file only wires them to BLEManager, AppModel and UIKit. It is the ONLY caller of
-// `BLEManager.wakeBuzz()`. No timers: nothing here runs by the clock, so nothing here can buzz by the clock.
+// `BLEManager.wakeBuzz()`. Nothing here STARTS by the clock: the one timer (v2.1) exists only inside a run the
+// intent started, is cancelled in `finish`, and only feeds `.tick` so the run's limits fire while no Bluetooth
+// frames arrive; a tick can buzz only while live HR samples are still arriving (the engine's stall gate).
 #if os(iOS)
 import Foundation
 import UIKit
@@ -14,6 +16,8 @@ enum WakeStartOutcome: Equatable {
     case decided(WakeTriggerDecision)
     /// The gate said start, but NOOP's app model didn't exist within the wait: no run, no marker.
     case notReady
+    /// v2.1: the run started, but no live HR arrived within `WakeConfig.linkWait`: ended as `.noLink`.
+    case noLink
 }
 
 @MainActor
@@ -39,6 +43,10 @@ final class WakeAlarmRunner {
     /// A relaunch found a run marker: the killed process may have left a pattern running on the band.
     /// One best-effort STOP_HAPTICS once the link is ready (never a buzz), then this clears.
     private var interruptedClearPending = false
+    /// v2.1: feeds `.tick` every `config.tickInterval` while a run is live (cancelled in `finish`).
+    private var ticker: Timer?
+    /// v2.1: what this run's start-of-run link request did (nil when the link was ready).
+    private var linkRequest: ForkLinkRecovery.WakeLinkRequest?
 
     private init() {}
 
@@ -149,7 +157,48 @@ final class WakeAlarmRunner {
         beginBackgroundTask()
         strapLog(WakeLogText.start(upLine: upLine, asleepLine: asleepLine, source: source,
                                    bandAlarmOn: model.behavior.smartAlarmEnabled))
+        startTicker()
+        linkRequest = nil
+
+        // v2.1: never sit silent with no band. No fresh HR → ask for the link (if it's down), then wait for a
+        // live sample until `linkWait` after the trigger; none → end the run as noLink and say so. The link
+        // request is left pending after the run, so data resumes; nothing here buzzes.
+        let deadline = now.addingTimeInterval(config.linkWait)
+        if WakeLinkWait.decide(newestSampleAt: ring.samples.last?.ts, now: Date(), deadline: deadline,
+                               config: config) != .proceed {
+            if !model.ble.wakeLinkReady {
+                linkRequest = model.ble.wakeRequestLink()
+                if linkRequest == .requested { strapLog(WakeLogText.reconnectRequested) }
+            }
+            strapLog(WakeLogText.waitingForHR)
+            while true {
+                // Ended meanwhile (Stop now, a limit): nothing more to decide here.
+                guard let live = run, live.started == started else { return .decided(.start) }
+                let verdict = WakeLinkWait.decide(newestSampleAt: ring.samples.last?.ts, now: Date(),
+                                                  deadline: deadline, config: config)
+                if verdict == .proceed { break }
+                if verdict == .noLink {
+                    var state = live
+                    let actions = WakeLoopEngine.stop(&state, reason: .noLink)
+                    run = state
+                    perform(actions, now: Date())
+                    return .noLink
+                }
+                // A cancelled intent stops waiting; the run goes on and its own limits (ticks) end it.
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
         return .decided(.start)
+    }
+
+    /// v2.1: the run's clock while the app is awake. Main run loop, so it fires on the main thread; it only
+    /// hops to `wake(now:)`, which is a no-op with no live run.
+    private func startTicker() {
+        ticker?.invalidate()
+        ticker = Timer.scheduledTimer(withTimeInterval: config.tickInterval, repeats: true) { _ in
+            Task { @MainActor in WakeAlarmRunner.shared.wake(now: Date()) }
+        }
     }
 
     private func logRefusal(_ decision: WakeTriggerDecision, settings s: WakeAlarmSettings) {
@@ -273,6 +322,8 @@ final class WakeAlarmRunner {
     private func finish(reason: WakeStopReason, now: Date) {
         guard let state = run else { return }
         run = nil
+        ticker?.invalidate()
+        ticker = nil
         BLEManager.wakeFrameObserver = nil
         BLEManager.wakeWriteErrorObserver = nil
         ledger = WakeBuzzLedger()
@@ -285,7 +336,12 @@ final class WakeAlarmRunner {
                                  quietCount: state.quietCount, rearmCount: state.rearmCount,
                                  buzzingSeconds: Int(state.buzzingSeconds(at: max(now, state.started)))))
         log.activeRunStartedAt = nil
-        strapLog(WakeLogText.stop(state, reason: reason, now: now))
+        if reason == .noLink {
+            strapLog(WakeLogText.noLinkStop(secs: max(0, Int(now.timeIntervalSince(state.started))),
+                                            reconnectRequested: linkRequest == .requested))
+        } else {
+            strapLog(WakeLogText.stop(state, reason: reason, now: now))
+        }
         endBackgroundTask()
     }
 

@@ -58,6 +58,13 @@ struct WakeConfig: Equatable {
     var quietResendDelay: TimeInterval = 3
     /// Total time spent buzzing (all buzzing stretches added up) that ends the run.
     var buzzBudget: TimeInterval = 600
+    /// At the start, with no fresh HR, how long (from the trigger) the intent waits for a live sample
+    /// before ending the run as `.noLink`. Includes the runner's model wait; keeps the intent well
+    /// under the Shortcuts time limit.
+    var linkWait: TimeInterval = 22
+    /// While the app is awake during a run, the runner feeds a `.tick` this often, so the watch window,
+    /// buzz budget and no-HR limit fire even when no Bluetooth frames arrive.
+    var tickInterval: TimeInterval = 5
     /// Consecutive failed buzz writes that stop the run.
     var maxBuzzFailures: Int = 3
     /// At most one buzz decision (buzz or skip) per this many seconds.
@@ -105,6 +112,19 @@ enum WakeStopReason: String, Codable, Equatable {
     case clockMoved
     /// The run spent `buzzBudget` seconds buzzing in total.
     case buzzBudget
+    /// The run started with no fresh HR and none arrived within `linkWait`: the band wasn't connected.
+    case noLink
+}
+
+/// The start-of-run wait for a live HR sample (pure, so the decision is unit-tested; the runner polls).
+enum WakeLinkWait: Equatable {
+    case proceed, wait, noLink
+
+    /// `proceed` once the newest sample is fresh (no older than `fresh`); `noLink` at the deadline.
+    static func decide(newestSampleAt: Date?, now: Date, deadline: Date, config: WakeConfig) -> WakeLinkWait {
+        if let ts = newestSampleAt, now.timeIntervalSince(ts) <= config.fresh, ts <= now { return .proceed }
+        return now >= deadline ? .noLink : .wait
+    }
 }
 
 /// Which half of the loop a live run is in.

@@ -5,6 +5,9 @@
 import Foundation
 
 enum WakeScreenText {
+    /// What "Start Wake Alarm" says (the automation's Show When Run banner) when the run ended `.noLink`.
+    static let noLinkDialog = "Band isn't connected — the wake alarm can't buzz this morning."
+
     /// How many past runs the screen lists.
     static let shownRuns = 7
 
@@ -34,6 +37,7 @@ enum WakeScreenText {
         switch reason {
         case .awake: return "you were up (heart rate stayed high)"
         case .timeout: return "the \(Int(config.watchWindow) / 60)-minute watch window ended"
+        case .noLink: return "the band wasn't connected, so it couldn't buzz"
         case .buzzBudget: return "\(Int(config.buzzBudget) / 60) minutes of buzzing in total"
         case .noHR: return "no heart rate from the band for \(Int(config.noHRLimit) / 60) minutes"
         case .buzzFailed: return "the band missed \(config.maxBuzzFailures) buzzes in a row"

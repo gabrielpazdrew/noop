@@ -25,6 +25,15 @@ enum WakeLogText {
         return "Wake: stop \(reason.rawValue) after \(secs)s, \(state.buzzCount) buzz(es) (\(state.confirmedBuzzCount) confirmed), \(state.skippedCount) skipped, buzzing \(buzzing)s, quiet \(state.quietCount)x, back asleep \(state.rearmCount)x, max HR \(maxHR)"
     }
 
+    /// The run started with no link: one system reconnect was asked for (it stays pending after the run).
+    static let reconnectRequested = "Wake: no link at start, reconnect requested"
+    static let waitingForHR = "Wake: no fresh heart rate yet, waiting for the band"
+
+    /// Replaces the usual stop line for a `.noLink` run.
+    static func noLinkStop(secs: Int, reconnectRequested: Bool) -> String {
+        "Wake: stop noLink — band not connected after \(secs)s (\(reconnectRequested ? "reconnect requested" : "no reconnect: link busy or disconnected by hand"))"
+    }
+
     static let ignoredLiveRun = "Wake: trigger ignored (run already live)"
     static let skippedOff = "Wake: skipped (switch off)"
 

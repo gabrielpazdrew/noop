@@ -582,6 +582,61 @@ final class WakeLoopEngineTests: XCTestCase {
         XCTAssertEqual(stops(all), [.noHR])
     }
 
+    func testALinkDropMidRunEndsOnTicksAsNoHR() {
+        var s = makeRun()
+        feed(&s, from: 0, secs: 101, bpm: 55)                  // live through 100, then the link drops
+        var all: [WakeAction] = []
+        for t in stride(from: 105.0, through: 300.0, by: 5.0) {  // the runner's 5 s ticks
+            all += step(&s, .tick, now: t, link: false)
+            if s.stopReason != nil { break }
+        }
+        XCTAssertEqual(stops(all), [.noHR])
+        XCTAssertEqual(s.newestNow, at(220), "stopped on the first tick 120 s after the last live sample")
+        XCTAssertEqual(buzzes(all), 0, "link down: every tick is a skip, never a buzz")
+    }
+
+    func testAnOverdueRunEndsOnTheFirstLateEventWithTheRightReason() {
+        // The app was suspended for hours: the next event (a tick, a frame, a trigger probe) ends it.
+        var s = makeRun()
+        feed(&s, from: 0, secs: 30, bpm: 55)
+        XCTAssertEqual(step(&s, .tick, now: 8630), [.stop(.timeout)], "watch window is checked before no-HR")
+        var q = quietRun()
+        XCTAssertEqual(step(&q, .tick, now: 400), [.stop(.noHR)], "inside the window: no HR")
+    }
+
+    func testNoLinkStopIsFinal() {
+        var s = makeRun()
+        XCTAssertEqual(step(&s, .tick, now: 5, link: false), [.skipBuzz(reason: "link not ready")])
+        XCTAssertEqual(WakeLoopEngine.stop(&s, reason: .noLink), [.stop(.noLink)])
+        XCTAssertEqual(step(&s, sample(23, 55), now: 23), [])
+        XCTAssertEqual(s.buzzCount, 0)
+    }
+
+    // MARK: link wait at the start
+
+    func testLinkWaitProceedsOnAFreshSample() {
+        let deadline = at(22)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(-10), now: t0, deadline: deadline, config: cfg), .proceed)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(-35), now: t0, deadline: deadline, config: cfg), .proceed)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(12), now: at(12.5), deadline: deadline, config: cfg), .proceed)
+    }
+
+    func testLinkWaitKeepsWaitingUntilTheDeadlineThenNoLink() {
+        let deadline = at(22)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: nil, now: t0, deadline: deadline, config: cfg), .wait)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(-36), now: at(1), deadline: deadline, config: cfg), .wait)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(-600), now: at(21.9), deadline: deadline, config: cfg), .wait)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: nil, now: at(22), deadline: deadline, config: cfg), .noLink)
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(-100), now: at(30), deadline: deadline, config: cfg), .noLink)
+        // A sample that lands right at the deadline still counts.
+        XCTAssertEqual(WakeLinkWait.decide(newestSampleAt: at(22), now: at(22), deadline: deadline, config: cfg), .proceed)
+    }
+
+    func testLinkWaitAndTickDefaults() {
+        XCTAssertEqual(cfg.linkWait, 22)
+        XCTAssertEqual(cfg.tickInterval, 5)
+    }
+
     func testNoHREndsTheRunWhileQuietToo() {
         var s = quietRun()                                     // last live sample at 120
         XCTAssertEqual(step(&s, .tick, now: 239.5), [.stopHaptics])   // the one re-send

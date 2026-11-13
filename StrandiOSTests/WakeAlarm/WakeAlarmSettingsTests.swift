@@ -131,6 +131,11 @@ final class WakeAlarmSettingsTests: XCTestCase {
         v2.stopReason = .buzzBudget; v2.quietCount = 2; v2.rearmCount = 1; v2.buzzingSeconds = 600
         log.append(v2)
         XCTAssertEqual(WakeRunLog(defaults: defaults).records, [r, noMax, v2])
+        var noLink = makeRecord(4)
+        noLink.stopReason = .noLink; noLink.quietCount = 0; noLink.rearmCount = 0; noLink.buzzingSeconds = 22
+        log.append(noLink)
+        XCTAssertEqual(WakeRunLog(defaults: defaults).records.last, noLink)
+        XCTAssertEqual(WakeStopReason(rawValue: "noLink"), .noLink)
     }
 
     func testInterruptedRecordCarriesNilForTheLoopCounts() {

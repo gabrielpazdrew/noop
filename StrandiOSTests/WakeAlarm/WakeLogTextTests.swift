@@ -35,6 +35,15 @@ final class WakeLogTextTests: XCTestCase {
                        "Wake: stop clockMoved after 0s, 12 buzz(es) (11 confirmed), 2 skipped, buzzing 0s, quiet 2x, back asleep 1x, max HR none")
     }
 
+    func testNoLinkLines() {
+        XCTAssertEqual(WakeLogText.noLinkStop(secs: 22, reconnectRequested: true),
+                       "Wake: stop noLink — band not connected after 22s (reconnect requested)")
+        XCTAssertEqual(WakeLogText.noLinkStop(secs: 21, reconnectRequested: false),
+                       "Wake: stop noLink — band not connected after 21s (no reconnect: link busy or disconnected by hand)")
+        XCTAssertEqual(WakeLogText.reconnectRequested, "Wake: no link at start, reconnect requested")
+        XCTAssertEqual(WakeLogText.waitingForHR, "Wake: no fresh heart rate yet, waiting for the band")
+    }
+
     func testSkippedLines() {
         XCTAssertEqual(WakeLogText.skippedOff, "Wake: skipped (switch off)")
         XCTAssertEqual(WakeLogText.ignoredLiveRun, "Wake: trigger ignored (run already live)")

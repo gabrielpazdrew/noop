@@ -36,6 +36,8 @@ final class WakeScreenTextTests: XCTestCase {
         XCTAssertEqual(WakeScreenText.stopReason(.awake), "you were up (heart rate stayed high)")
         XCTAssertEqual(WakeScreenText.stopReason(.timeout), "the 45-minute watch window ended")
         XCTAssertEqual(WakeScreenText.stopReason(.buzzBudget), "10 minutes of buzzing in total")
+        XCTAssertEqual(WakeScreenText.stopReason(.noLink), "the band wasn't connected, so it couldn't buzz")
+        XCTAssertEqual(WakeScreenText.noLinkDialog, "Band isn't connected — the wake alarm can't buzz this morning.")
         XCTAssertEqual(WakeScreenText.stopReason(.noHR), "no heart rate from the band for 2 minutes")
         XCTAssertEqual(WakeScreenText.stopReason(.buzzFailed), "the band missed 3 buzzes in a row")
         XCTAssertEqual(WakeScreenText.stopReason(.stopped), "you tapped Stop or turned the alarm off")
