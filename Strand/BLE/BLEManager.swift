@@ -1231,7 +1231,9 @@ public final class BLEManager: NSObject, ObservableObject {
     /// #747 / #750: after the bond is refused persistently, pause auto-reconnect (stop hammering) and write
     /// a one-line epitaph. Fed by the SAME refusal events as `bondRefusalStreak`; its higher give-up
     /// threshold fires once the pairing HINT has had several cycles to be acted on. Reset on a genuine bond
-    /// or an explicit user reconnect (so a manual retry re-arms auto-reconnect).
+    /// or an explicit user reconnect (so a manual retry re-arms auto-reconnect). fork-only (phone-hub, link):
+    /// "a genuine bond" is the 5/MG CLIENT_HELLO ack; a WHOOP 4.0 clears it once its bonded link has stayed up
+    /// `ForkLinkRecovery.pauseClearAfterBond` seconds (`forkClearPauseIfBondSurvives`).
     private var bondGiveUp = BondRefusalGiveUp()
     /// True while auto-reconnect is PAUSED by the #747 give-up. The disconnect-rescan and the
     /// failed-connect backoff both consult this and skip scheduling a reconnect; a manual connect()/
@@ -1246,6 +1248,9 @@ public final class BLEManager: NSObject, ObservableObject {
     /// probing a #617-paused link costs one bounded cycle and self-heals the same way); nil whenever the
     /// pause clears. Never persisted.
     private var bondLoopPausedAt: Date?
+    /// fork-only (phone-hub, link): when the no-data watchdog last cancelled the link itself. A paused disconnect
+    /// that follows it re-parks the connect at once (`ForkLinkRecovery.pausedDisconnectBypassesFloor`).
+    private var forkWatchdogBounceAt: Date?
     /// NotificationCenter token for the app-foreground salvage probe (installForegroundSalvageProbe).
     private var foregroundSalvageObserver: NSObjectProtocol?
     /// Multi-WHOOP stale-pin recovery (#52). Consecutive "Encryption/Authentication is insufficient" bond
@@ -1629,7 +1634,9 @@ public final class BLEManager: NSObject, ObservableObject {
     /// onBluetoothRadioOn parity): a refusal during it cannot write a second epitaph
     /// (`BondRefusalGiveUp.gaveUp` latches, `recordRefusal()` returns false) and the paused disconnect
     /// path schedules nothing afterwards, so the hammer loop cannot restart. A genuine bond still fully
-    /// resets via the didWriteValueFor path, so a strap freed since the give-up self-heals.
+    /// resets (5/MG: at the CLIENT_HELLO ack; WHOOP 4.0: once the bonded link survives
+    /// `ForkLinkRecovery.pauseClearAfterBond`, fork-only phone-hub link), so a strap freed since the
+    /// give-up self-heals.
     func connectFromSystem(model: WhoopModel = .persisted) {
         // #1881: the gate belongs HERE, not in the shared `connectCore`. This file already draws the line
         // the fix needs — `connect()` is the user's explicit Connect button, and every system-initiated
@@ -1920,7 +1927,8 @@ public final class BLEManager: NSObject, ObservableObject {
     /// #78 hole-4: ONE bounded salvage attempt while the bond-loop pause is latched, fired on
     /// app-foreground (see `installForegroundSalvageProbe`). This is what makes the give-up provably
     /// unable to strand a strap the user has since freed: a genuine bond on the probe fully resets the
-    /// pause via the normal didWriteValueFor path, while a still-refusing strap costs one attempt per
+    /// pause (5/MG at the CLIENT_HELLO ack; WHOOP 4.0 once the bonded link survives
+    /// `ForkLinkRecovery.pauseClearAfterBond`, fork-only phone-hub link), while a still-refusing strap costs one attempt per
     /// foreground per 10-minute floor and NEVER re-enters the hammer loop (the give-up stays latched, no
     /// second epitaph, the paused disconnect path schedules nothing). Re-stamps `bondLoopPausedAt` so
     /// back-to-back foregrounds can't chain probes.
@@ -4756,6 +4764,7 @@ public final class BLEManager: NSObject, ObservableObject {
             selectedModel.deviceFamily == .whoop5 ? 600 : 120
         if Date().timeIntervalSince(lastDataAt) > bounceFuse {
             log("No data for >\(Int(bounceFuse))s — bouncing link to resume streaming")
+            forkWatchdogBounceAt = Date()   // fork-only (phone-hub, link)
             if let p = peripheral { central.cancelPeripheralConnection(p) }
             return
         }
@@ -6150,7 +6159,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             // #844 — the loop is bond → drop → 3s rescan → bond → drop, forever, draining the battery.
             // Surfacing the guide alone left the involuntary-drop rescan (below) running. Pause auto-reconnect
             // too: the disconnect rescan and didFailToConnect both already skip while this is set, and a user
-            // Connect (connect()) or a genuine bond re-arms it. We do NOT touch the bond/parse path — the bond
+            // Connect (connect()) or a genuine bond re-arms it (WHOOP 4.0: a bond that survives 20 s; fork-only phone-hub link). We do NOT touch the bond/parse path — the bond
             // is real; the stale OS pairing is the problem, which the guide tells the user how to clear.
             autoReconnectPausedForBondLoop = true
             bondLoopPausedAt = Date()   // the #78 hole-4 salvage probe covers this pause too (one bounded cycle)
@@ -6308,7 +6317,12 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             log("Disconnected\(error.map { ": \($0.localizedDescription)" } ?? "")\(BLEManager.bleErrorSuffix(error)); auto-reconnect paused (strap keeps refusing to pair; tap Connect once it's free)")
             // #1539: a connect attempt CONSUMES the parked request, so re-park it — floored, so a reachable
             // strap that keeps refusing gets one attempt per window instead of a connect/refuse spin.
-            standingConnectWhilePausedIfDue()
+            // fork-only (phone-hub, link): our OWN watchdog bounce is not a refusal; it re-parks at once, so
+            // the bounce can never leave the strap with no reconnect request at all.
+            let ownBounce = ForkLinkRecovery.pausedDisconnectBypassesFloor(watchdogBounceAt: forkWatchdogBounceAt,
+                                                                           now: Date())
+            forkWatchdogBounceAt = nil
+            standingConnectWhilePausedIfDue(justTripped: ownBounce)
             if TestCentre.active(.connection) {
                 state.append(log: "connect down (uptime ends)", domain: .connection)
                 state.append(log: "reconnect paused=bondLoop (strap refusing bond)", domain: .connection)
@@ -6913,6 +6927,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             state.bonded = true
             state.encryptedBond = true   // WHOOP 4 confirmed-write bond is always genuine — #69
             bondedAt = Date()            // #617: start the bond→drop stopwatch for the bond-loop detector
+            forkClearPauseIfBondSurvives()   // fork-only (phone-hub, link): deferred check, clears nothing now
             noteGenuineBond(of: peripheral)   // #52: this strap bonds fine; clears any pin-refusal streak
             emitConnectionBondState("encryptedBond family=whoop4 (confirmed write acked)")
             log("BONDED (confirmed write acknowledged) — custom channels should now flow")
@@ -7561,6 +7576,43 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
 // fork-only (phone-hub, wake): PLAN-WAKE-PHONE T4a. Inert unless StrandiOS/WakeAlarm sets the observers
 // (nothing sets them on macOS). No new payloads or opcodes: wakeBuzz() only calls the existing buzzStrapOnce().
 extension BLEManager {
+    /// fork-only (phone-hub, wake): the one link request a wake run makes when it starts with no link. A
+    /// SYSTEM connect (`connectFromSystem`: the #1881 active-device gate, never resets the bond-loop give-up),
+    /// targeted at the selected strap, no timeout, nothing written to the strap. Refused while connected (a
+    /// handshake may be in flight), after a deliberate Disconnect (connectCore would clear it), with
+    /// Bluetooth off, or with no selected strap (never a scan). Logs one line either way.
+    @discardableResult
+    func wakeRequestLink() -> ForkLinkRecovery.WakeLinkRequest {
+        let r = ForkLinkRecovery.wakeLinkRequest(connected: state.connected,
+                                                 intentionalDisconnect: intentionalDisconnect,
+                                                 poweredOn: central.state == .poweredOn,
+                                                 hasPinnedStrap: preferredPeripheralUUID != nil)
+        log(r.logLine)
+        if r == .requested { connectFromSystem() }
+        return r
+    }
+
+    /// fork-only (phone-hub, link): a WHOOP 4.0's bond never cleared the bond-loop pause, so a pause tripped
+    /// hours earlier outlived a healthy link and blocked every later auto-reconnect. Called at the 4.0 bond;
+    /// clears the pause only if the SAME bonded connection is still up `ForkLinkRecovery.pauseClearAfterBond`
+    /// seconds later. A bond-then-drop loop drops inside the #617 window and a refusing strap never bonds,
+    /// so the #844 hammer protection stands.
+    func forkClearPauseIfBondSurvives() {
+        guard autoReconnectPausedForBondLoop else { return }
+        let gen = connectGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + ForkLinkRecovery.pauseClearAfterBond) { [weak self] in
+            guard let self,
+                  ForkLinkRecovery.shouldClearPause(paused: self.autoReconnectPausedForBondLoop,
+                                                    connected: self.state.connected,
+                                                    sameConnection: self.connectGeneration == gen,
+                                                    bonded: self.state.bonded) else { return }
+            self.bondGiveUp.reset()
+            self.autoReconnectPausedForBondLoop = false
+            self.bondLoopPausedAt = nil
+            self.log("Bond-loop pause cleared: link healthy for \(Int(ForkLinkRecovery.pauseClearAfterBond)) s")
+        }
+    }
+
     /// Every READABLE standard-HR sample (bpm, arrival time), after parseStandardHR's own handling.
     static var wakeHeartRateObserver: ((Int, Date) -> Void)?
     /// Every inbound notification frame (arrival time), where the liveness watchdog is fed.

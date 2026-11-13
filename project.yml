@@ -531,6 +531,8 @@ targets:
       # Fork-only (phone-hub, wake): the phone wake alarm's pure engine, gate and settings.
       - StrandiOSTests/WakeAlarm
       - StrandiOS/WakeAlarm/Core
+      # Fork-only (phone-hub, link): the Foundation-only bond-loop pause / link-request rules.
+      - Strand/BLE/ForkLinkRecovery.swift
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
